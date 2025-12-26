@@ -1,68 +1,30 @@
-Alpine LXC 极简 Xray Reality 一键脚本
-🚀 项目简介
-本项目专为 Alpine Linux (特别是 LXC 虚拟化架构) 的轻量级 VPS 打造。针对 512M 内存、NAT 网络 以及 长距离/高延迟（如欧洲至中国） 的线路进行了深度优化。
+# 🏔️ Alpine LXC Xray Reality 一键调优脚本
 
-由于 Alpine 默认不使用 systemd，且 LXC 环境对内核参数有限制，本脚本采用了 OpenRC + local.d 的方式实现开机自启。
+[![Platform](https://img.shields.io/badge/OS-Alpine_Linux-blue?logo=alpine&logoColor=white)](https://alpinelinux.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
+[![Xray](https://img.shields.io/badge/Core-Xray--core-orange)](https://github.com/XTLS/Xray-core)
 
-✨ 优化特性
-内核加速：自动检测并开启 TCP BBR 拥塞控制算法。
+这是一款专为 **Alpine Linux**（特别是 **LXC** 虚拟化架构）设计的轻量级 Xray 安装与优化脚本。针对 **512M 小内存** 及 **NAT 网络** 进行了深度调优，旨在高延迟环境下提供极致的连接速度。
 
-网络调优：强制设置 MTU 为 1380，解决 NAT 转发导致的丢包与卡顿。
+---
 
-极简占用：无多余监控程序，适合 512M 甚至更低内存的“小鸡”。
+## ✨ 核心特性
 
-抗封锁：使用目前主流的 VLESS + TCP + REALITY + Vision 组合。
+* **🚀 传输加速**：自动检测并开启 `TCP BBR` 拥塞控制算法。
+* **📡 网络优化**：针对 NAT 环境强制设置 `MTU 1380`，彻底解决长距离传输下的丢包与卡顿。
+* **🛡️ 顶级伪装**：采用 `VLESS` + `TCP` + `REALITY` + `Vision` 组合，目前最强的抗封锁方案。
+* **🍃 极简占用**：原生 `OpenRC` 启动管理，无多余监控程序，内存占用极低。
+* **🔒 动态安全**：安装时现场生成 UUID 和密钥对，**拒绝硬编码**，确保 GitHub 源码泄露也不会威胁你的服务器安全。
+* **🕒 自我修复**：预设每日凌晨自动重启，确保持续稳定运行，防止小内存溢出（OOM）。
 
-自我修复：内置每日凌晨 4:00 自动重启任务，防止内存溢出导致断连。
+---
 
-🛠️ 安装方法
-在 Alpine 终端执行以下命令（请先确保已安装 curl）：
+## 🛠️ 快速安装
 
-Bash
+在您的 Alpine 终端中直接复制并执行以下命令：
 
-# 1. 下载脚本
-curl -L -o alpine_xray.sh https://raw.githubusercontent.com/你的用户名/你的仓库名/main/alpine_xray.sh
+```bash
+curl -O [https://raw.githubusercontent.com/您的用户名/仓库名/main/alpine_xray.sh](https://raw.githubusercontent.com/您的用户名/仓库名/main/alpine_xray.sh) && chmod +x alpine_xray.sh && ./alpine_xray.sh
 
-# 2. 赋予执行权限
-chmod +x alpine_xray.sh
 
-# 3. 运行脚本
-./alpine_xray.sh
-📋 客户端配置说明
-脚本运行完成后，会输出以下关键信息，请将其填入 v2rayN 或 Clash：
-
-地址 (Address): 你的服务器公网 IP
-
-端口 (Port): 52300 (或你在脚本中自定义的端口)
-
-用户 ID (UUID): 97b8a903-842c-4339-bb84-2abdd773f3d9
-
-流控 (Flow): xtls-rprx-vision
-
-传输层安全 (Security): reality
-
-SNI: www.ikea.com (推荐使用北欧站点优化)
-
-Fingerprint: chrome
-
-PublicKey: (脚本运行后生成的 Password 字段)
-
-ShortId: 0123456789abcdef
-
-🔍 运维常用命令
-查看运行状态：ps | grep xray
-
-手动重启服务：rc-service local restart
-
-查看配置信息：cat /etc/xray/config.json
-
-查看系统负载：top
-
-实时查看日志 (调试用)：xray run -c /etc/xray/config.json
-
-⚠️ 注意事项
-网卡名称：脚本默认优化 eth0 网卡。如果你的网卡名称不同（可通过 ip addr 查看），请手动修改脚本中的 eth0 字样。
-
-NAT 端口映射：请确保你的 NAT 商家后台已将外网端口正确映射至内网的 52300。
-
-虚拟内存：如果 512M 内存依然频繁崩溃，建议手动创建 Swap 分区。
+📋 客户端配置指南脚本运行完成后，终端会输出您的专属连接信息。请参照以下参数配置您的客户端（如 v2rayN, Clash Meta, Shadowrocket 等）：配置项参数值协议 (Protocol)VLESS流控 (Flow)xtls-rprx-vision加密 (Encryption)none传输层安全 (Security)REALITYSNI / ServerNamewww.ikea.comFingerprintchromePublicKey / pbk脚本输出的 Password 字段ShortId / sid0123456789abcdef⚙️ 进阶运维由于 Alpine 不使用 systemd，请使用以下 OpenRC 命令管理服务：重启服务：rc-service local restart停止服务：rc-service local stop查看运行状态：ps | grep xray修改配置：vi /etc/xray/config.json实时调试：若连接失败，可运行 xray run -c /etc/xray/config.json 查看报错日志。⚠️ 常见问题网卡适配：脚本默认针对 eth0 网卡进行 MTU 优化。若您的网卡名称不同（可通过 ip addr 查看），请修改脚本中第 67 行的网卡名称。NAT 端口映射：请确保在您的 VPS 商家面板中，已将内网端口 52300 正确映射至您的公网端口。内存管理：若机器频繁失联，请检查 free -m。若内存依然吃紧，建议在终端运行 dd if=/dev/zero of=/swapfile bs=1M count=512 && mkswap /swapfile && swapon /swapfile 以开启虚拟内存。📜 开源协议基于 MIT License 许可发行。
