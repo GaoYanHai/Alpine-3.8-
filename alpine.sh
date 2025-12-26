@@ -24,7 +24,7 @@ cat << CONF > /etc/xray/config.json
         "port": 52300,
         "protocol": "vless",
         "settings": {
-            "clients": [{"id": "97b8a903-842c-4339-bb84-2abdd773f3d9", "flow": "xtls-rprx-vision"}],
+            "clients": [{"id": "111111111111111111111111", "flow": "xtls-rprx-vision"}],
             "decryption": "none"
         },
         "streamSettings": {
@@ -66,8 +66,8 @@ echo "0 4 * * * rc-service local restart" >> /var/spool/cron/crontabs/root
 echo "-------------------------------------------------------"
 echo "安装完成！"
 echo "公网 IP: $(curl -s ifconfig.me)"
-echo "端口: 52300"
-echo "UUID: 97b8a903-842c-4339-bb84-2abdd773f3d9"
+echo "端口: 111111111"
+echo "UUID: 11111111111111111111111"
 echo "Public Key (客户端填这个): $PUB_KEY"
 echo "SNI: www.ikea.com"
 echo "Flow: xtls-rprx-vision"
