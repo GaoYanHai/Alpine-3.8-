@@ -45,6 +45,13 @@ ShortId / sid            0123456789abcdef
 查看运行状态：ps | grep xray
 修改配置：vi /etc/xray/config.json
 实时调试：若连接失败，可运行 xray run -c /etc/xray/config.json 查看报错日志。
+“三板斧”快速自救
+第一步：强制拉起配置（会自动改 MTU 和启动 Xray）
+sh /etc/local.d/xray.start
+第二步：查看内存占用（防止 512M 爆掉）
+free -m
+第三步：查看时间（Reality 协议对时间很敏感，误差不能超过 90 秒）
+date
 ⚠️ 常见问题
 网卡适配：脚本默认针对 eth0 网卡进行 MTU 优化。若您的网卡名称不同（可通过 ip addr 查看），请修改脚本中第 67 行的网卡名称。NAT 端口映射：请确保在您的 VPS 商家面板中，已将内网端口 52300 正确映射至您的公网端口。
 内存管理：若机器频繁失联，请检查 free -m。若内存依然吃紧，
