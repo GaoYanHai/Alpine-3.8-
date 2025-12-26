@@ -27,4 +27,28 @@
 curl -O [https://raw.githubusercontent.com/您的用户名/仓库名/main/alpine_xray.sh](https://raw.githubusercontent.com/您的用户名/仓库名/main/alpine_xray.sh) && chmod +x alpine_xray.sh && ./alpine_xray.sh
 
 
-📋 客户端配置指南脚本运行完成后，终端会输出您的专属连接信息。请参照以下参数配置您的客户端（如 v2rayN, Clash Meta, Shadowrocket 等）：配置项参数值协议 (Protocol)VLESS流控 (Flow)xtls-rprx-vision加密 (Encryption)none传输层安全 (Security)REALITYSNI / ServerNamewww.ikea.comFingerprintchromePublicKey / pbk脚本输出的 Password 字段ShortId / sid0123456789abcdef⚙️ 进阶运维由于 Alpine 不使用 systemd，请使用以下 OpenRC 命令管理服务：重启服务：rc-service local restart停止服务：rc-service local stop查看运行状态：ps | grep xray修改配置：vi /etc/xray/config.json实时调试：若连接失败，可运行 xray run -c /etc/xray/config.json 查看报错日志。⚠️ 常见问题网卡适配：脚本默认针对 eth0 网卡进行 MTU 优化。若您的网卡名称不同（可通过 ip addr 查看），请修改脚本中第 67 行的网卡名称。NAT 端口映射：请确保在您的 VPS 商家面板中，已将内网端口 52300 正确映射至您的公网端口。内存管理：若机器频繁失联，请检查 free -m。若内存依然吃紧，建议在终端运行 dd if=/dev/zero of=/swapfile bs=1M count=512 && mkswap /swapfile && swapon /swapfile 以开启虚拟内存。📜 开源协议基于 MIT License 许可发行。
+📋 客户端配置指南
+脚本运行完成后，终端会输出您的专属连接信息。请参照以下参数配置您的客户端（如 v2rayN,
+Clash Meta, Shadowrocket 等）：
+配置项           参数值
+协议 (Protocol)  VLESS
+流控 (Flow)      xtls-rprx-vision
+加密 (Encryption)none
+传输层安全 (Security)REALITY
+SNI / ServerName  www.ikea.com
+Fingerprint       chrome
+PublicKey / pbk脚本输出的 Password 字段
+ShortId / sid0123456789abcdef
+⚙️ 进阶运维
+由于 Alpine 不使用 systemd，请使用以下 OpenRC 命令管理服务：
+重启服务：rc-service local restart
+停止服务：rc-service local stop
+查看运行状态：ps | grep xray
+修改配置：vi /etc/xray/config.json
+实时调试：若连接失败，可运行 xray run -c /etc/xray/config.json 查看报错日志。
+⚠️ 常见问题
+网卡适配：脚本默认针对 eth0 网卡进行 MTU 优化。若您的网卡名称不同（可通过 ip addr 查看），
+请修改脚本中第 67 行的网卡名称。NAT 端口映射：请确保在您的 VPS 商家面板中，已将内网端口 52300 正确映射至您的公网端口。
+内存管理：若机器频繁失联，请检查 free -m。若内存依然吃紧，
+建议在终端运行 dd if=/dev/zero of=/swapfile bs=1M count=512 && mkswap /swapfile && swapon /swapfile 以开启虚拟内存。
+📜 开源协议基于 MIT License 许可发行。
