@@ -5,7 +5,7 @@
 [![Xray](https://img.shields.io/badge/Core-Xray--core-orange)](https://github.com/XTLS/Xray-core)
 [![Security](https://img.shields.io/badge/Security-REALITY-red)](https://github.com/XTLS/Xray-core/releases)
 
-这是一款专为 **Alpine Linux**（特别是 **LXC 容器**）设计的高性能 Xray 安装与优化脚本。针对 **512MB 小内存** 和 **NAT 网络环境** 进行了深度调优，具备最强的抗审查能力。
+这是一款专为 **Alpine Linux**（特别是 **LXC 容器**）设计的高性能 Xray 安装与优化脚本。针对 **512MB 小内存** 和 **NAT 网络环境** 进行了深度调优，具备完整的容错机制。
 
 ---
 
@@ -13,14 +13,15 @@
 
 | 特性 | 说明 |
 |------|------|
-| 🚀 **BBR 加速** | 自动检测并启用 TCP BBR 拥塞控制，大幅提升传输效率 |
-| 📡 **MTU 优化** | NAT 环境强制设置 MTU 1380，完全解决长距离丢包问题 |
+| 🌍 **NAT 环境优先** | 自动网卡检测，MTU 失败时优雅降级，支持低权限环境 |
+| 📡 **MTU 智能设置** | NAT 环境设置 MTU 1380 解决丢包，失败不中断 |
+| 🚀 **BBR 自适应** | 支持则启用，不支持则降级到系统默认算法 |
 | 🛡️ **抗审查** | VLESS + TCP + REALITY + Vision，业界最强伪装方案 |
 | 🍃 **低占用** | OpenRC 原生管理，无冗余进程，内存占用 < 50MB |
 | 🔒 **动态安全** | 运行时生成 UUID 和密钥，源码泄露不威胁服务器 |
 | 🕒 **自我修复** | 每天 04:00 自动重启，防止小内存 OOM |
-| ⚡ **容错机制** | 下载失败自动重试 3 次，增强稳定性 |
-| ✅ **配置验证** | JSON 格式检查，防止配置错误导致启动失败 |
+| ⚡ **强化容错** | 下载失败自动重试 3 次，二进制验证，JSON 格式检查 |
+| ✅ **配置验证** | 完整的文件有效性检查，防止启动失败 |
 
 ---
 
@@ -140,7 +141,8 @@ ntpd -q -p pool.ntp.org  # 强制同步时间（若需要）
 |------|------|--------|
 | **连接失败** | Reality 时间误差 > 90s | 运行 `date` 检查，使用 `ntpd` 同步 |
 | **频繁断连** | 内存不足 OOM | 检查 `free -m`，开启 Swap 虚拟内存 |
-| **MTU 设置失败** | 网卡名非 eth0 | 执行 `ip addr` 查看实际网卡，修改 `/etc/local.d/xray.start` |
+| **MTU 设置失败** | NAT 网络不支持修改 | **继续使用系统默认值**（脚本已优雅降级） |
+| **BBR 启用失败** | 内核不支持 BBR | **自动降级到系统默认算法**（脚本已处理） |
 | **下载 Xray 失败** | 网络不稳定 | 脚本自动重试 3 次，仍失败可手动下载后再执行 |
 | **配置文件格式错误** | JSON 结构破损 | 运行 `jq empty /etc/xray/config.json` 验证 |
 
@@ -193,27 +195,52 @@ sed -i 's/"loglevel": "debug"/"loglevel": "none"/g' /etc/xray/config.json
 | **操作系统** | Alpine Linux 3.8+ |
 | **内存** | ≥ 512 MB（推荐 1 GB） |
 | **磁盘** | ≥ 1 GB 空闲空间 |
-| **网络** | 需要可靠的外网连接 |
+| **网络** | NAT 或直连网络均支持 |
 | **权限** | 需要 root 权限执行 |
 
 ---
 
-## 🚀 性能优化建议
+## 🌍 NAT 环境兼容性说明
 
-### 1. 启用 BBR（已自动执行）
+本脚本针对 NAT 环境进行了完整优化：
+
+### 网卡自动检测
 ```bash
-# 验证 BBR 是否启用
-sysctl net.ipv4.tcp_congestion_control
-# 输出应为: net.ipv4.tcp_congestion_control = bbr
+# 自动识别网卡（不依赖 eth0）
+NETIF=$(ip route | grep default | awk '{print $5}' | head -1)
 ```
 
-### 2. 调整 MTU 值（若需自定义）
-```bash
-# 临时修改（重启后失效）
-ip link set dev eth0 mtu 1400
+### MTU 智能设置
+- 尝试设置 MTU 1380（NAT 环境推荐值）
+- 失败时**优雅降级**，继续使用系统默认值
+- 不会因为权限不足而中断执行
 
-# 永久修改（编辑启动脚本）
-vi /etc/local.d/xray.start  # 修改 mtu 1380 为目标值
+### BBR 自动降级
+- 尝试启用 BBR 拥塞控制
+- 不支持时自动降级到系统默认算法
+- 脚本继续正常执行
+
+### 低权限环境支持
+- 即使无法修改 BBR、MTU，脚本仍能完整运行
+- 所有网络优化均为可选，不影响核心功能
+
+---
+
+## 🚀 高级优化建议
+
+### 1. 验证 BBR 是否启用
+```bash
+sysctl net.ipv4.tcp_congestion_control
+# 如果输出为 bbr，说明启用成功
+# 如果输出为其他值（如 cubic），说明环境不支持，继续使用默认值即可
+```
+
+### 2. 自定义 MTU 值
+```bash
+# 若需要调整 MTU 为其他值：
+vi /etc/local.d/xray.start
+# 修改 mtu 1380 为目标值（如 1400, 1500 等）
+rc-service local restart
 ```
 
 ### 3. 监控服务健康度
@@ -229,6 +256,8 @@ while true; do
     sleep 300  # 每 5 分钟检查一次
 done
 EOF
+
+chmod +x /usr/local/bin/monitor.sh
 ```
 
 ---
@@ -243,6 +272,18 @@ EOF
 ---
 
 ## 📄 更新日志
+
+### v2.1（NAT 兼容增强版）- 2026-06-10
+- ✨ **核心改进**：NAT 环境自动兼容
+- ✨ 网卡自动检测，支持非 eth0 网卡
+- ✨ MTU/BBR 失败时优雅降级（不中断执行）
+- ✨ 增强下载可靠性（3 次重试机制）
+- ✨ 文件有效性完整验证
+- ✨ 二进制兼容性检查
+- ✨ 服务启动验证反馈
+- 🐛 修复权限不足导致脚本失败的问题
+- 📈 提升低权限环境的可用性
+- 📚 完整重写 NAT 环境指南
 
 ### v2.0（改进版）- 2026-06-10
 - ✨ 新增错误处理与验证机制
