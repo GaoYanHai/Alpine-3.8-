@@ -88,20 +88,46 @@ fi
 echo "正在生成加密密钥..."
 USER_UUID=$("$XRAY_BIN" uuid)
 
-# 更安全的密钥提取方式（支持多种输出格式）
+# 使用 POSIX 兼容的 grep（替代 PCRE -P 选项以提高 Debian 兼容性）
 KEYS_OUTPUT=$("$XRAY_BIN" x25519)
-PRIV_KEY=$(echo "$KEYS_OUTPUT" | grep -oP '(?<=PrivateKey:\s)\S+' || echo "")
-PUB_KEY=$(echo "$KEYS_OUTPUT" | grep -oP '(?<=PublicKey:\s)\S+' || echo "")
 
-# 备选提取方式（针对不同版本的 Xray）
+# 调试输出（可选，帮助诊断）
+echo "调试信息 - Xray x25519 输出:" >&2
+echo "$KEYS_OUTPUT" >&2
+
+# 方法1: 使用 sed 和 awk 的 POSIX 兼容方式
+PRIV_KEY=$(echo "$KEYS_OUTPUT" | sed -n 's/.*PrivateKey:[[:space:]]*\([^[:space:]]*\).*/\1/p')
+PUB_KEY=$(echo "$KEYS_OUTPUT" | sed -n 's/.*PublicKey:[[:space:]]*\([^[:space:]]*\).*/\1/p')
+
+# 备选提取方式（针对不同版本的 Xray 输出格式）
 if [ -z "$PUB_KEY" ]; then
-    PUB_KEY=$(echo "$KEYS_OUTPUT" | grep -oP '(?<=Password:\s)\S+' || echo "")
+    # 尝试从 Password 字段提取（某些版本可能使用此字段）
+    PUB_KEY=$(echo "$KEYS_OUTPUT" | sed -n 's/.*Password:[[:space:]]*\([^[:space:]]*\).*/\1/p')
+fi
+
+# 如果还是找不到，尝试从整行提取（防止格式差异）
+if [ -z "$PUB_KEY" ]; then
+    PUB_KEY=$(echo "$KEYS_OUTPUT" | tail -n 1 | awk '{print $NF}')
 fi
 
 # 验证密钥是否成功提取
-[ -z "$PRIV_KEY" ] && error_exit "无法提取私钥"
-[ -z "$PUB_KEY" ] && error_exit "无法提取公钥"
-[ -z "$USER_UUID" ] && error_exit "无法生成 UUID"
+if [ -z "$PRIV_KEY" ]; then
+    echo "❌ 错误: 无法提取私钥" >&2
+    echo "原始输出: $KEYS_OUTPUT" >&2
+    error_exit "无法提取私钥"
+fi
+
+if [ -z "$PUB_KEY" ]; then
+    echo "❌ 错误: 无法提取公钥" >&2
+    echo "原始输出: $KEYS_OUTPUT" >&2
+    error_exit "无法提取公钥"
+fi
+
+if [ -z "$USER_UUID" ]; then
+    error_exit "无法生成 UUID"
+fi
+
+echo "✅ 密钥生成成功"
 
 # 4. 生成 Xray 配置文件（日志全关版）
 echo "正在生成配置文件..."
