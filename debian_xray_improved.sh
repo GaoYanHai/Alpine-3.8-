@@ -278,19 +278,49 @@ else
     systemctl status xray.service || true
 fi
 
-# 9. 配置定时重启任务（防止小内存 OOM）
+# 9. 配置定时重启任务（使用 systemd timer 替代 cron，兼容 LXD 环境）
 echo "正在配置定时重启任务..."
-CRON_JOB="0 4 * * * systemctl restart xray.service"
 
-# 避免重复添加 cron 任务
-if ! crontab -l 2>/dev/null | grep -q "systemctl restart xray.service"; then
-    (crontab -l 2>/dev/null || echo "") | grep -v "systemctl restart xray.service" | (cat; echo "$CRON_JOB") | crontab -
-    echo "✅ 定时重启任务已配置（每日 04:00）"
+# 创建 systemd timer 单位（比 cron 更适合容器环境）
+cat > /etc/systemd/system/xray-restart.timer << 'TIMER'
+[Unit]
+Description=Daily Xray Service Restart Timer
+Requires=xray-restart.service
+
+[Timer]
+OnCalendar=daily
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+cat > /etc/systemd/system/xray-restart.service << 'RESTARTSERVICE'
+[Unit]
+Description=Restart Xray Service
+After=xray.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart xray.service
+RESTARTSERVICE
+
+# 尝试启用 systemd timer
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload
+    systemctl enable xray-restart.timer 2>/dev/null && systemctl start xray-restart.timer 2>/dev/null && \
+        echo "✅ 定时重启任务已配置（systemd timer，每日 04:00）" || \
+        echo "⚠️  警告: systemd timer 配置失败，但 Xray 服务正常运行"
+else
+    echo "⚠️  警告: systemd 不可用，跳过定时重启配置"
 fi
 
-# 确保 cron 服务运行
-run_cmd systemctl enable cron
-run_cmd systemctl start cron
+# 可选：如果环境支持 cron，也安装它作为备选
+if command -v apt-get >/dev/null 2>&1 && ! command -v crontab >/dev/null 2>&1; then
+    echo "正在尝试安装 cron 作为备选定时方案..."
+    apt-get install -y cron 2>/dev/null || echo "⚠️  cron 安装失败，使用 systemd timer"
+fi
 
 # 10. 输出安装结果
 echo ""
@@ -316,13 +346,13 @@ Fingerprint: chrome
    • 配置文件位于: $XRAY_CONFIG
    • 服务文件位于: /etc/systemd/system/xray.service
    • 网络配置脚本: /usr/local/bin/setup-xray-network.sh
-   • 定时任务已配置：每日 04:00 自动重启清理内存
+   • 定时任务已配置：systemd timer（每日 04:00 自动重启清理内存）
 
 🌍 Debian LXD 环境兼容说明:
    • MTU 已设置为 1380（解决长距离丢包）
    • 若 MTU 设置失败：此环境不支持修改（继续使用系统默认值）
    • BBR 自动检测：支持则启用，不支持则降级使用 cubic
-   • 使用 systemd 管理服务（替代 OpenRC）
+   • 使用 systemd 管理服务和定时任务（替代 cron）
    • 所有容错机制均已启用，确保低权限环境下可用
 
 📋 故障排查:
@@ -333,5 +363,6 @@ Fingerprint: chrome
    • 手动重启: systemctl restart xray.service
    • 停止服务: systemctl stop xray.service
    • 启动服务: systemctl start xray.service
+   • 查看定时任务: systemctl list-timers xray-restart.timer
 -------------------------------------------------------
 EOF
