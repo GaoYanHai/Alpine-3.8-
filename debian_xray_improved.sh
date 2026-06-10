@@ -3,7 +3,7 @@
 # ====================================================
 # Project: Debian LXD Xray Reality One-Click Script
 # Platform: Debian trixie amd64 (20251224_0350)
-# Features: Enhanced error handling, systemd integration, Debian compatibility
+# Features: Enhanced error handling, systemd integration, auto SNI detection, Debian compatibility
 # ====================================================
 
 set -e  # 错误时立即退出，避免继续执行
@@ -12,13 +12,22 @@ set -u  # 未定义变量时报错
 # 0. 自定义基础变量
 PORT=52300
 SHORT_ID="0123456789abcdef"
-DEST_SITE="www.ikea.com:443"
-SNI="www.ikea.com"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/etc/xray/config.json"
 XRAY_DIR="/etc/xray"
 XRAY_USER="xray"
 XRAY_GROUP="xray"
+
+# SNI 候选列表（按优先级，可自行调整）
+SNI_CANDIDATES=(
+    "www.google.com"
+    "www.bing.com"
+    "www.cloudflare.com"
+    "outlook.live.com"
+    "www.facebook.com"
+    "cdn.cloudflare.net"
+    "www.microsoft.com"
+)
 
 # 错误处理函数
 error_exit() {
@@ -33,10 +42,45 @@ run_cmd() {
     fi
 }
 
+# 自动检测延迟最低的 SNI
+detect_best_sni() {
+    echo "正在检测延迟最低的 SNI..."
+    echo "候选 SNI 列表: ${SNI_CANDIDATES[*]}"
+    echo ""
+    
+    local best_sni=""
+    local best_latency=99999
+    
+    for sni in "${SNI_CANDIDATES[@]}"; do
+        # 使用 curl 的 TLS 连接时间来测试延迟
+        local latency=$(curl -w "%{time_connect}" -o /dev/null -s --max-time 5 "https://${sni}" 2>/dev/null || echo "9999")
+        
+        # 转换为毫秒（便于阅读）
+        local latency_ms=$(echo "$latency * 1000" | bc 2>/dev/null || echo "9999000")
+        
+        echo "🔍 $sni: ${latency_ms}ms"
+        
+        # 比较延迟（使用字符串比较，因为是浮点数）
+        if (( $(echo "$latency < $best_latency" | bc -l) )); then
+            best_latency=$latency
+            best_sni=$sni
+        fi
+    done
+    
+    echo ""
+    if [ -n "$best_sni" ]; then
+        echo "✅ 最优 SNI: $best_sni (延迟: $(echo "$best_latency * 1000" | bc 2>/dev/null || echo "$best_latency")ms)"
+        echo "$best_sni"
+    else
+        echo "⚠️  无法检测 SNI，使用默认值 www.google.com"
+        echo "www.google.com"
+    fi
+}
+
 # 1. 环境准备与依赖安装（Debian apt-get）
 echo "正在安装基础依赖..."
 run_cmd apt-get update
-run_cmd apt-get install -y curl ca-certificates unzip jq
+run_cmd apt-get install -y curl ca-certificates unzip jq bc
 
 # 创建 Xray 用户和必要目录
 if ! id "$XRAY_USER" >/dev/null 2>&1; then
@@ -84,7 +128,13 @@ if ! "$XRAY_BIN" version > /dev/null 2>&1; then
     error_exit "Xray 二进制文件损坏或架构不兼容"
 fi
 
+# 2.5 自动检测最优 SNI（新增功能）
+echo ""
+SNI=$(detect_best_sni)
+DEST_SITE="${SNI}:443"
+
 # 3. 动态生成身份凭证（安全提取）
+echo ""
 echo "正在生成加密密钥..."
 USER_UUID=$("$XRAY_BIN" uuid)
 
@@ -131,7 +181,7 @@ echo "✅ 密钥生成成功"
 
 # 4. 生成 Xray 配置文件（日志全关版）
 echo "正在生成配置文件..."
-cat > "$XRAY_CONFIG" << 'CONF'
+cat > "$XRAY_CONFIG" << CONF
 {
     "log": {
         "loglevel": "none",
@@ -139,11 +189,11 @@ cat > "$XRAY_CONFIG" << 'CONF'
         "error": "/dev/null"
     },
     "inbounds": [{
-        "port": 52300,
+        "port": $PORT,
         "protocol": "vless",
         "settings": {
             "clients": [{
-                "id": "placeholder_uuid",
+                "id": "$USER_UUID",
                 "flow": "xtls-rprx-vision"
             }],
             "decryption": "none"
@@ -153,21 +203,17 @@ cat > "$XRAY_CONFIG" << 'CONF'
             "security": "reality",
             "realitySettings": {
                 "show": false,
-                "dest": "www.ikea.com:443",
+                "dest": "$DEST_SITE",
                 "xver": 0,
-                "serverNames": ["www.ikea.com"],
-                "privateKey": "placeholder_privkey",
-                "shortIds": ["0123456789abcdef"]
+                "serverNames": ["$SNI"],
+                "privateKey": "$PRIV_KEY",
+                "shortIds": ["$SHORT_ID"]
             }
         }
     }],
     "outbounds": [{ "protocol": "freedom" }]
 }
 CONF
-
-# 替换占位符
-sed -i "s|placeholder_uuid|$USER_UUID|g" "$XRAY_CONFIG"
-sed -i "s|placeholder_privkey|$PRIV_KEY|g" "$XRAY_CONFIG"
 
 # 验证 JSON 配置文件格式
 if ! jq empty "$XRAY_CONFIG" 2>/dev/null; then
@@ -336,7 +382,7 @@ cat << EOF
 用户 ID (UUID): $USER_UUID
 流控 (Flow): xtls-rprx-vision
 传输安全 (Security): reality
-SNI: $SNI
+SNI: $SNI（自动检测的最优选择）
 公钥 (PublicKey): $PUB_KEY
 ShortID: $SHORT_ID
 Fingerprint: chrome
@@ -349,6 +395,7 @@ Fingerprint: chrome
    • 定时任务已配置：systemd timer（每日 04:00 自动重启清理内存）
 
 🌍 Debian LXD 环境兼容说明:
+   • SNI 自动检测：检测延迟最低的域名作为代理目标
    • MTU 已设置为 1380（解决长距离丢包）
    • 若 MTU 设置失败：此环境不支持修改（继续使用系统默认值）
    • BBR 自动检测：支持则启用，不支持则降级使用 cubic
@@ -364,5 +411,11 @@ Fingerprint: chrome
    • 停止服务: systemctl stop xray.service
    • 启动服务: systemctl start xray.service
    • 查看定时任务: systemctl list-timers xray-restart.timer
+
+🔧 更换 SNI（如需调整）:
+   编辑配置文件，在 realitySettings 中修改：
+   "dest": "新域名:443"
+   "serverNames": ["新域名"]
+   然后运行: systemctl restart xray.service
 -------------------------------------------------------
 EOF
