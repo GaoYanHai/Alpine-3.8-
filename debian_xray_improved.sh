@@ -44,35 +44,35 @@ run_cmd() {
 
 # 自动检测延迟最低的 SNI
 detect_best_sni() {
-    echo "正在检测延迟最低的 SNI..."
-    echo "候选 SNI 列表: ${SNI_CANDIDATES[*]}"
-    echo ""
-    
+    echo "正在检测延迟最低的 SNI..." >&2
+    echo "候选 SNI 列表: ${SNI_CANDIDATES[*]}" >&2
+    echo "" >&2
+
     local best_sni=""
     local best_latency=99999
-    
+
     for sni in "${SNI_CANDIDATES[@]}"; do
         # 使用 curl 的 TLS 连接时间来测试延迟
         local latency=$(curl -w "%{time_connect}" -o /dev/null -s --max-time 5 "https://${sni}" 2>/dev/null || echo "9999")
-        
+
         # 转换为毫秒（便于阅读）
         local latency_ms=$(echo "$latency * 1000" | bc 2>/dev/null || echo "9999000")
-        
-        echo "🔍 $sni: ${latency_ms}ms"
-        
-        # 比较延迟（使用字符串比较，因为是浮点数）
-        if (( $(echo "$latency < $best_latency" | bc -l) )); then
+
+        echo "🔍 $sni: ${latency_ms}ms" >&2
+
+        # 比较延迟
+        if [ "$(echo "$latency < $best_latency" | bc -l)" = "1" ]; then
             best_latency=$latency
             best_sni=$sni
         fi
     done
-    
-    echo ""
+
+    echo "" >&2
     if [ -n "$best_sni" ]; then
-        echo "✅ 最优 SNI: $best_sni (延迟: $(echo "$best_latency * 1000" | bc 2>/dev/null || echo "$best_latency")ms)"
+        echo "✅ 最优 SNI: $best_sni (延迟: $(echo "$best_latency * 1000" | bc 2>/dev/null || echo "$best_latency")ms)" >&2
         echo "$best_sni"
     else
-        echo "⚠️  无法检测 SNI，使用默认值 www.google.com"
+        echo "⚠️  无法检测 SNI，使用默认值 www.google.com" >&2
         echo "www.google.com"
     fi
 }
@@ -92,21 +92,33 @@ run_cmd chown -R "$XRAY_USER:$XRAY_GROUP" "$XRAY_DIR"
 
 # 2. 下载并安装最新版 Xray-core（带重试机制）
 echo "正在下载 Xray-core..."
-XRAY_ZIP="/tmp/xray-$$.zip"
-trap "rm -f $XRAY_ZIP" EXIT  # 确保删除临时文件
+XRAY_ZIP=$(mktemp /tmp/xray-XXXXXX.zip)
+cleanup() { rm -f "$XRAY_ZIP"; }
+trap cleanup EXIT
 
-# 添加重试逻辑（最多3次尝试）
+# 添加重试逻辑（最多3次尝试，含镜像回退）
 RETRY=0
 MAX_RETRIES=3
+DOWNLOAD_URLS=(
+    "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+    "https://ghfast.top/https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+    "https://ghproxy.net/https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+)
 while [ $RETRY -lt $MAX_RETRIES ]; do
-    if curl -L --connect-timeout 10 --max-time 60 -o "$XRAY_ZIP" \
-        "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"; then
-        break
+    URL_INDEX=$((RETRY % ${#DOWNLOAD_URLS[@]}))
+    echo "尝试下载 ($((RETRY+1))/$MAX_RETRIES): ${DOWNLOAD_URLS[$URL_INDEX]}"
+    if curl -L --connect-timeout 15 --max-time 120 -o "$XRAY_ZIP" \
+        "${DOWNLOAD_URLS[$URL_INDEX]}"; then
+        # 验证下载的确实是 ZIP 文件（防止镜像返回 HTML 错误页）
+        if file "$XRAY_ZIP" 2>/dev/null | grep -qi 'zip'; then
+            break
+        fi
+        echo "下载内容不是有效的 ZIP 文件，尝试下一个源..."
     fi
     RETRY=$((RETRY + 1))
     if [ $RETRY -lt $MAX_RETRIES ]; then
-        echo "下载失败，5秒后重试 $RETRY/$MAX_RETRIES..."
-        sleep 5
+        echo "下载失败，3秒后重试..."
+        sleep 3
     fi
 done
 
@@ -222,7 +234,7 @@ fi
 echo "✅ 配置文件 JSON 格式验证通过"
 
 # 设置文件权限
-run_cmd chmod 644 "$XRAY_CONFIG"
+run_cmd chmod 640 "$XRAY_CONFIG"
 run_cmd chown "$XRAY_USER:$XRAY_GROUP" "$XRAY_CONFIG"
 
 # 5. 系统网络优化（Debian 兼容）
@@ -230,9 +242,9 @@ echo "正在进行网络性能调优..."
 
 # 尝试启用 BBR（可能不支持，失败也继续）
 {
-    grep -v "net.core.default_qdisc" /etc/sysctl.conf 2>/dev/null || true
-    grep -v "net.ipv4.tcp_congestion_control" /etc/sysctl.conf 2>/dev/null || true
-    # 仅在 BBR 支持的环境下启用，否则降级到 cubic
+    if [ -f /etc/sysctl.conf ]; then
+        grep -v '^net\.core\.default_qdisc=' /etc/sysctl.conf | grep -v '^net\.ipv4\.tcp_congestion_control=' || true
+    fi
     echo "net.core.default_qdisc=fq"
     echo "net.ipv4.tcp_congestion_control=bbr"
 } > /etc/sysctl.conf.tmp && mv /etc/sysctl.conf.tmp /etc/sysctl.conf
@@ -299,7 +311,7 @@ if command -v ip >/dev/null 2>&1; then
 fi
 
 # 验证 MTU 设置
-CURRENT_MTU=$(ip link show "$NETIF" 2>/dev/null | grep -oP '(?<=mtu\s)\d+' || echo "")
+CURRENT_MTU=$(ip link show "$NETIF" 2>/dev/null | grep -o 'mtu [0-9]*' | awk '{print $2}' || echo "")
 if [ "$CURRENT_MTU" = "1380" ]; then
     echo "✅ MTU 已设置为 1380"
 else
@@ -334,7 +346,6 @@ Description=Daily Xray Service Restart Timer
 Requires=xray-restart.service
 
 [Timer]
-OnCalendar=daily
 OnCalendar=*-*-* 04:00:00
 Persistent=true
 
