@@ -77,6 +77,34 @@ detect_best_sni() {
     fi
 }
 
+# 0.5 检测并设置时区和编码
+echo "正在检查时区..."
+CURRENT_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "unknown")
+if [ "$CURRENT_TZ" != "Asia/Shanghai" ]; then
+    echo "  当前时区: $CURRENT_TZ，正在设置为 Asia/Shanghai..."
+    timedatectl set-timezone Asia/Shanghai 2>/dev/null || ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && echo "Asia/Shanghai" > /etc/timezone 2>/dev/null
+    echo "✅ 时区已设置为 Asia/Shanghai"
+else
+    echo "✅ 时区已是 Asia/Shanghai，无需修改"
+fi
+
+# 设置 UTF-8 编码
+CURRENT_LOCALE=$(locale charmap 2>/dev/null || echo "unknown")
+if [ "$CURRENT_LOCALE" != "UTF-8" ]; then
+    echo "  当前编码: $CURRENT_LOCALE，正在设置为 UTF-8..."
+    apt-get install -y locales > /dev/null 2>&1 || true
+    sed -i 's/# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen 2>/dev/null || true
+    sed -i 's/# *zh_CN.UTF-8/zh_CN.UTF-8/' /etc/locale.gen 2>/dev/null || true
+    locale-gen en_US.UTF-8 zh_CN.UTF-8 > /dev/null 2>&1 || true
+    update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 2>/dev/null || true
+    export LANG=en_US.UTF-8
+    export LC_ALL=en_US.UTF-8
+    echo "✅ 编码已设置为 UTF-8"
+else
+    echo "✅ 编码已是 UTF-8，无需修改"
+fi
+echo ""
+
 # 1. 环境准备与依赖安装（Debian apt-get）
 echo "正在安装基础依赖..."
 run_cmd apt-get update
