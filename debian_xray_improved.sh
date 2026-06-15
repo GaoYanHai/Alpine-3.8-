@@ -22,8 +22,10 @@ XRAY_GROUP="xray"
 SNI_CANDIDATES=(
     "www.google.com"
     "www.bing.com"
+    "www.cloudflare.com"
     "outlook.live.com"
     "www.facebook.com"
+    "cdn.cloudflare.net"
     "www.microsoft.com"
 )
 
@@ -149,26 +151,21 @@ echo ""
 echo "正在生成加密密钥..."
 USER_UUID=$("$XRAY_BIN" uuid)
 
-# 使用 POSIX 兼容的 grep（替代 PCRE -P 选项以提高 Debian 兼容性）
 KEYS_OUTPUT=$("$XRAY_BIN" x25519)
 
-# 调试输出（可选，帮助诊断）
+# 调试输出
 echo "调试信息 - Xray x25519 输出:" >&2
 echo "$KEYS_OUTPUT" >&2
 
-# 方法1: 使用 sed 和 awk 的 POSIX 兼容方式
+# 提取密钥（适配不同 Xray 版本的输出格式）
+# 新版格式: PrivateKey: xxx  /  Password (PublicKey): xxx
+# 旧版格式: PrivateKey: xxx  /  PublicKey: xxx
 PRIV_KEY=$(echo "$KEYS_OUTPUT" | sed -n 's/.*PrivateKey:[[:space:]]*\([^[:space:]]*\).*/\1/p')
-PUB_KEY=$(echo "$KEYS_OUTPUT" | sed -n 's/.*PublicKey:[[:space:]]*\([^[:space:]]*\).*/\1/p')
+PUB_KEY=$(echo "$KEYS_OUTPUT" | sed -n 's/.*Password.*:[[:space:]]*\([^[:space:]]*\).*/\1/p')
 
-# 备选提取方式（针对不同版本的 Xray 输出格式）
+# 兜底：如果 Password 行没匹配到，尝试 PublicKey
 if [ -z "$PUB_KEY" ]; then
-    # 尝试从 Password 字段提取（某些版本可能使用此字段）
-    PUB_KEY=$(echo "$KEYS_OUTPUT" | sed -n 's/.*Password:[[:space:]]*\([^[:space:]]*\).*/\1/p')
-fi
-
-# 如果还是找不到，尝试从整行提取（防止格式差异）
-if [ -z "$PUB_KEY" ]; then
-    PUB_KEY=$(echo "$KEYS_OUTPUT" | tail -n 1 | awk '{print $NF}')
+    PUB_KEY=$(echo "$KEYS_OUTPUT" | sed -n 's/.*PublicKey:[[:space:]]*\([^[:space:]]*\).*/\1/p')
 fi
 
 # 验证密钥是否成功提取
