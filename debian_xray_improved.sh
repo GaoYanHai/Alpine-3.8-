@@ -22,10 +22,8 @@ XRAY_GROUP="xray"
 SNI_CANDIDATES=(
     "www.google.com"
     "www.bing.com"
-    "www.cloudflare.com"
     "outlook.live.com"
     "www.facebook.com"
-    "cdn.cloudflare.net"
     "www.microsoft.com"
 )
 
