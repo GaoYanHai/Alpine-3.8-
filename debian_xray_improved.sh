@@ -90,50 +90,51 @@ fi
 run_cmd mkdir -p "$XRAY_DIR" "$(dirname "$XRAY_BIN")"
 run_cmd chown -R "$XRAY_USER:$XRAY_GROUP" "$XRAY_DIR"
 
-# 2. 下载并安装最新版 Xray-core（带重试机制）
-echo "正在下载 Xray-core..."
-XRAY_ZIP=$(mktemp /tmp/xray-XXXXXX.zip)
-cleanup() { rm -f "$XRAY_ZIP"; }
-trap cleanup EXIT
+# 2. 检测已有 Xray 核心，不存在则下载
+if [ -x "$XRAY_BIN" ] && "$XRAY_BIN" version > /dev/null 2>&1; then
+    echo "✅ 检测到已安装的 Xray: $("$XRAY_BIN" version 2>&1 | head -1)"
+    echo "   跳过下载，直接使用现有版本"
+else
+    echo "正在下载 Xray-core..."
+    XRAY_ZIP=$(mktemp /tmp/xray-XXXXXX.zip)
+    cleanup() { rm -f "$XRAY_ZIP"; }
+    trap cleanup EXIT
 
-# 添加重试逻辑（最多3次尝试，含镜像回退）
-RETRY=0
-MAX_RETRIES=3
-DOWNLOAD_URLS=(
-    "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
-    "https://ghfast.top/https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
-    "https://ghproxy.net/https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
-)
-while [ $RETRY -lt $MAX_RETRIES ]; do
-    URL_INDEX=$((RETRY % ${#DOWNLOAD_URLS[@]}))
-    echo "尝试下载 ($((RETRY+1))/$MAX_RETRIES): ${DOWNLOAD_URLS[$URL_INDEX]}"
-    if curl -L --connect-timeout 15 --max-time 120 -o "$XRAY_ZIP" \
-        "${DOWNLOAD_URLS[$URL_INDEX]}"; then
-        # 验证下载的确实是 ZIP 文件（防止镜像返回 HTML 错误页）
-        if file "$XRAY_ZIP" 2>/dev/null | grep -qi 'zip'; then
-            break
+    RETRY=0
+    MAX_RETRIES=10
+    while [ $RETRY -lt $MAX_RETRIES ]; do
+        echo "尝试下载 ($((RETRY+1))/$MAX_RETRIES)..."
+        CURL_ERR=$(mktemp /tmp/curl-err-XXXXXX)
+        if curl -L --connect-timeout 15 --max-time 120 -o "$XRAY_ZIP" \
+            "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip" 2>"$CURL_ERR"; then
+            if head -c 4 "$XRAY_ZIP" 2>/dev/null | od -A n -t x1 | tr -d ' \n' | grep -q '^504b0304'; then
+                rm -f "$CURL_ERR"
+                echo "✅ 下载成功"
+                break
+            fi
+            echo "  下载内容不是有效 ZIP，重试中..."
+        else
+            CURL_EXIT=$?
+            echo "  curl 失败 (exit $CURL_EXIT): $(tail -1 "$CURL_ERR" 2>/dev/null)"
         fi
-        echo "下载内容不是有效的 ZIP 文件，尝试下一个源..."
+        rm -f "$CURL_ERR"
+        RETRY=$((RETRY + 1))
+        if [ $RETRY -lt $MAX_RETRIES ]; then
+            sleep 3
+        fi
+    done
+
+    if [ $RETRY -eq $MAX_RETRIES ]; then
+        echo "" >&2
+        echo "❌ 自动下载失败（GitHub 可能无法访问）" >&2
+        echo "请设置代理后重试: export https_proxy=http://代理地址:端口" >&2
+        exit 1
     fi
-    RETRY=$((RETRY + 1))
-    if [ $RETRY -lt $MAX_RETRIES ]; then
-        echo "下载失败，3秒后重试..."
-        sleep 3
-    fi
-done
 
-if [ $RETRY -eq $MAX_RETRIES ]; then
-    error_exit "无法下载 Xray-core，超过最大重试次数"
+    run_cmd unzip -o "$XRAY_ZIP" xray -d "$(dirname "$XRAY_BIN")"
+    run_cmd chmod +x "$XRAY_BIN"
+    run_cmd chown "$XRAY_USER:$XRAY_GROUP" "$XRAY_BIN"
 fi
-
-# 验证 ZIP 文件有效性
-if [ ! -f "$XRAY_ZIP" ] || [ ! -s "$XRAY_ZIP" ]; then
-    error_exit "下载的 Xray 文件无效或为空"
-fi
-
-run_cmd unzip -o "$XRAY_ZIP" xray -d "$(dirname "$XRAY_BIN")"
-run_cmd chmod +x "$XRAY_BIN"
-run_cmd chown "$XRAY_USER:$XRAY_GROUP" "$XRAY_BIN"
 
 # 验证 Xray 二进制文件可执行性
 if ! "$XRAY_BIN" version > /dev/null 2>&1; then
