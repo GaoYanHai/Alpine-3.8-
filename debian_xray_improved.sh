@@ -20,13 +20,14 @@ XRAY_GROUP="xray"
 
 # SNI 候选列表（按优先级，可自行调整）
 SNI_CANDIDATES=(
-    "www.google.com"
-    "www.bing.com"
-    "www.cloudflare.com"
-    "outlook.live.com"
-    "www.facebook.com"
-    "cdn.cloudflare.net"
     "www.microsoft.com"
+    "swdlp.apple.com"
+    "www.sony.co.jp"
+    "www.samsung.com"
+    "www.shopee.sg"
+    "www.bmw.com"
+    "www.dyson.co.uk"
+    "www.intel.com"
 )
 
 # 错误处理函数
