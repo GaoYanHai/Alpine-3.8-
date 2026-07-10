@@ -8,6 +8,8 @@
 
 set -e  # 错误时立即退出，避免继续执行
 set -u  # 未定义变量时报错
+# 尽量启用 pipefail（若 shell 支持）
+set -o pipefail 2>/dev/null || true
 
 # 0. 自定义基础变量
 PORT=52300
@@ -33,8 +35,9 @@ run_cmd() {
 
 # 1. 环境准备与依赖安装
 echo "正在安装基础依赖..."
+# 添加必要依赖，使用 --no-cache 减少镜像缓存
 run_cmd apk update
-run_cmd apk add curl gcompat ca-certificates unzip
+run_cmd apk add --no-cache curl gcompat ca-certificates unzip iproute2 procps jq
 
 # 创建必要目录
 run_cmd mkdir -p "$XRAY_DIR" "$(dirname "$XRAY_BIN")"
@@ -42,7 +45,7 @@ run_cmd mkdir -p "$XRAY_DIR" "$(dirname "$XRAY_BIN")"
 # 2. 下载并安装最新版 Xray-core（带重试机制）
 echo "正在下载 Xray-core..."
 XRAY_ZIP="/tmp/xray-$$.zip"
-trap "rm -f $XRAY_ZIP" EXIT  # 确保删除临时文件
+trap 'rm -f "$XRAY_ZIP"' EXIT  # 确保删除临时文件
 
 # 添加重试逻辑（最多3次尝试）
 RETRY=0
@@ -78,19 +81,29 @@ fi
 
 # 3. 动态生成身份凭证（安全提取）
 echo "正在生成加密密钥..."
-USER_UUID=$("$XRAY_BIN" uuid)
+# 先尝试使用 xray 自带的工具生成，如果不可用则回退
+if command -v "$XRAY_BIN" >/dev/null 2>&1 && "$XRAY_BIN" uuid >/dev/null 2>&1; then
+    USER_UUID=$("$XRAY_BIN" uuid)
+else
+    # 回退：使用内核随机 UUID 或简单占位
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        USER_UUID=$(cat /proc/sys/kernel/random/uuid)
+    else
+        USER_UUID=$(printf '%s' "$(date +%s)-$RANDOM")
+    fi
+fi
 
-# 更安全的密钥提取方式（支持多种输出格式）
-KEYS_OUTPUT=$("$XRAY_BIN" x25519)
-PRIV_KEY=$(echo "$KEYS_OUTPUT" | grep -oP '(?<=PrivateKey:\s)\S+' || echo "")
-PUB_KEY=$(echo "$KEYS_OUTPUT" | grep -oP '(?<=PublicKey:\s)\S+' || echo "")
+# 更安全的密钥提取方式（支持多种输出格式），使用 awk 代替 grep -P
+KEYS_OUTPUT=$("$XRAY_BIN" x25519 2>/dev/null || true)
+PRIV_KEY=$(printf '%s\n' "$KEYS_OUTPUT" | awk '/PrivateKey:/{print $2; exit}' || true)
+PUB_KEY=$(printf '%s\n' "$KEYS_OUTPUT" | awk '/PublicKey:/{print $2; exit}' || true)
 
 # 备选提取方式（针对不同版本的 Xray）
 if [ -z "$PUB_KEY" ]; then
-    PUB_KEY=$(echo "$KEYS_OUTPUT" | grep -oP '(?<=Password:\s)\S+' || echo "")
+    PUB_KEY=$(printf '%s\n' "$KEYS_OUTPUT" | awk '/Password:/{print $2; exit}' || true)
 fi
 
-# 验证密钥是否成功提取
+# 验证密钥是否成功提取（允许某些环境使用占位并警告）
 [ -z "$PRIV_KEY" ] && error_exit "无法提取私钥"
 [ -z "$PUB_KEY" ] && error_exit "无法提取公钥"
 [ -z "$USER_UUID" ] && error_exit "无法生成 UUID"
@@ -131,9 +144,19 @@ cat > "$XRAY_CONFIG" << 'CONF'
 }
 CONF
 
-# 替换占位符
-sed -i "s|placeholder_uuid|$USER_UUID|g" "$XRAY_CONFIG"
-sed -i "s|placeholder_privkey|$PRIV_KEY|g" "$XRAY_CONFIG"
+# 使用 jq 安全替换字段（如果可用），否则回退到安全的 sed 替换
+if command -v jq >/dev/null 2>&1; then
+    tmp_cfg=$(mktemp)
+    jq --arg id "$USER_UUID" --arg pk "$PRIV_KEY" \
+       '.inbounds[0].settings.clients[0].id=$id | .inbounds[0].streamSettings.realitySettings.privateKey=$pk' \
+       "$XRAY_CONFIG" > "$tmp_cfg" && mv "$tmp_cfg" "$XRAY_CONFIG"
+else
+    # sed 分隔符选择为 | 并转义特殊字符
+    esc_priv=$(printf '%s' "$PRIV_KEY" | sed -e 's/[\/&]/\\&/g')
+    esc_uuid=$(printf '%s' "$USER_UUID" | sed -e 's/[\/&]/\\&/g')
+    sed -i "s|placeholder_uuid|$esc_uuid|g" "$XRAY_CONFIG"
+    sed -i "s|placeholder_privkey|$esc_priv|g" "$XRAY_CONFIG"
+fi
 
 # 验证 JSON 配置文件格式
 if command -v jq >/dev/null 2>&1; then
@@ -148,13 +171,13 @@ fi
 # 5. 系统网络优化（NAT 兼容性优先）
 echo "正在进行网络性能调优..."
 
-# 尝试启用 BBR（NAT 环境可能不支持，失败也继续）
+# 备份 sysctl 配置
+cp /etc/sysctl.conf /etc/sysctl.conf.bak 2>/dev/null || true
 {
     grep -v "net.core.default_qdisc" /etc/sysctl.conf 2>/dev/null || true
     grep -v "net.ipv4.tcp_congestion_control" /etc/sysctl.conf 2>/dev/null || true
     # 仅在 BBR 支持的环境下启用，否则降级到 cubic
-    echo "net.core.default_qdisc=fq"
-    echo "net.ipv4.tcp_congestion_control=bbr"
+    printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n'
 } > /etc/sysctl.conf.tmp && mv /etc/sysctl.conf.tmp /etc/sysctl.conf
 
 # 应用 sysctl 配置，失败不中断
@@ -163,7 +186,7 @@ if sysctl -p > /dev/null 2>&1; then
 else
     echo "⚠️  警告: BBR 在当前环境不可用，降级使用系统默认算法"
     # 移除 BBR 配置以防启动失败
-    sed -i '/tcp_congestion_control/d' /etc/sysctl.conf
+    sed -i '/tcp_congestion_control/d' /etc/sysctl.conf || true
 fi
 
 # 6. 配置开机自启与 MTU 修正（NAT 环境兼容）
@@ -173,7 +196,7 @@ cat > /etc/local.d/xray.start << 'START'
 # NAT 兼容的网卡检测和 MTU 设置
 
 # 自动检测网卡名称
-NETIF=$(ip route | grep default | awk '{print $5}' | head -1)
+NETIF=$(ip route 2>/dev/null | awk '/default/ {print $5; exit}')
 if [ -z "$NETIF" ]; then
     NETIF="eth0"
 fi
@@ -189,7 +212,7 @@ elif command -v ifconfig >/dev/null 2>&1; then
 fi
 
 # 验证 MTU 设置
-CURRENT_MTU=$(ip link show "$NETIF" 2>/dev/null | grep -oP '(?<=mtu\s)\d+' || echo "")
+CURRENT_MTU=$(ip link show "$NETIF" 2>/dev/null | awk '/mtu/ {for(i=1;i<=NF;i++) if($i=="mtu") {print $(i+1); exit}}' || true)
 if [ "$CURRENT_MTU" = "1380" ]; then
     echo "✅ MTU 已设置为 1380"
 else
@@ -202,11 +225,13 @@ START
 
 run_cmd chmod +x /etc/local.d/xray.start
 run_cmd rc-update add local default
-run_cmd rc-service local restart
+run_cmd rc-service local restart || true
 
 # 验证服务是否成功启动
 sleep 2
-if pgrep -f "xray run" > /dev/null; then
+if (command -v pgrep >/dev/null 2>&1 && pgrep -f "xray run" >/dev/null 2>&1) \
+   || (command -v pidof >/dev/null 2>&1 && pidof xray >/dev/null 2>&1) \
+   || (ss -ltnp 2>/dev/null | grep -q ":$PORT "); then
     echo "✅ Xray 服务已成功启动"
 else
     echo "⚠️  警告: Xray 服务可能启动失败，检查配置或日志"
@@ -217,14 +242,18 @@ echo "正在配置定时重启任务..."
 CRON_DIR="/var/spool/cron/crontabs"
 run_cmd mkdir -p "$CRON_DIR"
 
-# 避免重复添加 cron 任务
-if [ ! -f "$CRON_DIR/root" ] || ! grep -q "rc-service local restart" "$CRON_DIR/root" 2>/dev/null; then
-    echo "0 4 * * * rc-service local restart" > "$CRON_DIR/root"
+# 避免覆盖已有 cron 任务，使用追加方式
+if [ ! -f "$CRON_DIR/root" ]; then
+    touch "$CRON_DIR/root"
+    chmod 600 "$CRON_DIR/root"
+fi
+if ! grep -q "rc-service local restart" "$CRON_DIR/root" 2>/dev/null; then
+    printf '%s\n' "0 4 * * * rc-service local restart" >> "$CRON_DIR/root"
     chmod 600 "$CRON_DIR/root"
 fi
 
 run_cmd rc-update add crond default
-run_cmd rc-service crond start
+run_cmd rc-service crond start || true
 
 # 8. 输出安装结果
 echo ""
@@ -246,7 +275,7 @@ ShortID: $SHORT_ID
 Fingerprint: chrome
 -------------------------------------------------------
 🔒 安全提示:
-  �� 请不要在公共评论区贴出以上信息！
+  • 请不要在公共评论区贴出以上信息！
   • 配置文件位于: $XRAY_CONFIG
   • 启动脚本位于: /etc/local.d/xray.start
   • 定时任务已配置：每日 04:00 自动重启清理内存
