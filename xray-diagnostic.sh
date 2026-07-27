@@ -16,10 +16,13 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# 获取配置
+# 获取配置（兼容 BusyBox，不使用 grep -P）
 XRAY_CONFIG="/etc/xray/config.json"
-XRAY_PORT=$(grep -oP '(?<="port":\s)\d+' "$XRAY_CONFIG" | head -1)
-SNI=$(grep -oP '(?<="serverNames":\s\[")[^"]+' "$XRAY_CONFIG" | head -1)
+XRAY_LOG="/var/log/xray.log"
+XRAY_PORT=$(sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$XRAY_CONFIG" | head -1)
+SNI=$(sed -n 's/.*"serverNames"[[:space:]]*:[[:space:]]*\[[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
+PRIV_KEY=$(sed -n 's/.*"privateKey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
+SHORT_ID=$(sed -n 's/.*"shortIds"[[:space:]]*:[[:space:]]*\[[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
 
 echo "📋 基本信息"
 echo "配置文件: $XRAY_CONFIG"
@@ -27,16 +30,28 @@ echo "监听端口: $XRAY_PORT"
 echo "SNI: $SNI"
 echo ""
 
-# 1. 检查 Xray 进程
+# 1. 检查 Xray 进程（兼容 systemd / OpenRC）
 echo "=========================================="
 echo "1️⃣  检查 Xray 进程状态"
 echo "=========================================="
-if systemctl is-active --quiet xray.service; then
-    echo -e "${GREEN}✅ Xray 服务正在运行${NC}"
-    systemctl status xray.service | head -10
+XRAY_RUNNING=0
+if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^xray.service'; then
+    if systemctl is-active --quiet xray.service; then
+        echo -e "${GREEN}✅ Xray systemd 服务正在运行${NC}"
+        systemctl status xray.service | head -10
+        XRAY_RUNNING=1
+    else
+        echo -e "${RED}❌ Xray systemd 服务未运行${NC}"
+        echo "尝试启动: systemctl start xray.service"
+    fi
+elif pgrep -f "xray run" >/dev/null 2>&1 || ps 2>/dev/null | grep -q "[x]ray run"; then
+    echo -e "${GREEN}✅ 检测到 Xray 进程正在运行${NC}"
+    ps aux 2>/dev/null | grep "[x]ray" || ps | grep "[x]ray"
+    XRAY_RUNNING=1
 else
-    echo -e "${RED}❌ Xray 服务未运行${NC}"
-    echo "尝试启动: systemctl start xray.service"
+    echo -e "${RED}❌ 未检测到 Xray 进程${NC}"
+    echo "Alpine 尝试: rc-service local restart"
+    echo "Debian 尝试: systemctl start xray.service"
 fi
 echo ""
 
@@ -95,7 +110,7 @@ echo "4️⃣  检查 MTU 设置"
 echo "=========================================="
 DEFAULT_DEV=$(ip route | grep default | awk '{print $5}' | head -1)
 if [ -n "$DEFAULT_DEV" ]; then
-    MTU=$(ip link show "$DEFAULT_DEV" | grep -oP '(?<=mtu\s)\d+')
+    MTU=$(ip link show "$DEFAULT_DEV" | sed -n 's/.*mtu \([0-9][0-9]*\).*/\1/p')
     echo "网卡: $DEFAULT_DEV"
     echo "MTU: $MTU"
     if [ "$MTU" != "1500" ] && [ "$MTU" != "1380" ]; then
@@ -168,6 +183,32 @@ echo "完整配置:"
 cat "$XRAY_CONFIG" | jq '.inbounds[0].streamSettings.realitySettings' 2>/dev/null || echo "无法解析"
 echo ""
 
+# 8.5 检查时间与日志（REALITY 关键）
+echo "=========================================="
+echo "8.5️⃣  检查系统时间与日志"
+echo "=========================================="
+echo "当前时间: $(date)"
+if command -v timedatectl >/dev/null 2>&1; then
+    timedatectl | head -5
+fi
+if [ -f "$XRAY_LOG" ]; then
+    echo "最近日志:"
+    tail -n 30 "$XRAY_LOG" 2>/dev/null || true
+else
+    echo -e "${YELLOW}⚠️  未找到 $XRAY_LOG（可能仍把日志丢到 /dev/null）${NC}"
+fi
+if [ -z "$PRIV_KEY" ]; then
+    echo -e "${RED}❌ 配置中未读到 privateKey${NC}"
+else
+    echo -e "${GREEN}✅ privateKey 已存在（长度: $(printf %s "$PRIV_KEY" | wc -c)）${NC}"
+fi
+if [ -z "$SHORT_ID" ]; then
+    echo -e "${YELLOW}⚠️  未读到 shortId${NC}"
+else
+    echo "ShortId: $SHORT_ID"
+fi
+echo ""
+
 # 9. 诊断建议
 echo "=========================================="
 echo "📝 诊断建议"
@@ -192,6 +233,14 @@ echo "   mtr <服务器IP>"
 echo ""
 echo "5. 查看详细日志："
 echo "   journalctl -u xray.service -f"
+echo "   tail -n 100 /var/log/xray.log"
+echo ""
+echo "6. 核对客户端参数必须完全一致："
+echo "   UUID / PublicKey / ShortId / SNI / Flow=xtls-rprx-vision / Fingerprint=chrome"
+echo ""
+echo "7. 检查服务器时间误差（超过约 90 秒 Reality 会失败）："
+echo "   date"
+echo "   chronyc tracking 2>/dev/null || timedatectl"
 echo ""
 echo "=========================================="
 echo "✅ 诊断完成"

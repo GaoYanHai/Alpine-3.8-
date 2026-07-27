@@ -10,7 +10,18 @@
 
 ---
 
-## 🆕 更新说明（2026-06-10）
+## 🆕 更新说明（2026-07-27）
+
+### 修复：端口通但客户端连不上（Debian 重点）
+- 🐛 **Debian**：显式监听 `0.0.0.0`，避免部分 LXD/NAT 环境握手异常
+- 🐛 **Debian**：日志从 `/dev/null` 改为 `/var/log/xray.log`，systemd 输出同步落盘
+- 🐛 **Debian**：放宽 `ProtectSystem=strict` 为 `full`，并允许写日志目录，便于排障
+- 🐛 **Debian**：修复 `systemctl start xray.service` 失败（ExecStartPre 提权、降低容器沙箱、启动前 `xray run -test`）
+- 🐛 **Alpine**：密钥提取改为 BusyBox 兼容的 `sed`，优先识别新版 Xray 的 `Password` 公钥字段
+- 🐛 **Alpine**：补齐 `xray.stop`，重启前先清理旧进程，避免“端口还在但配置未生效”
+- ✨ **Alpine**：安装并启用 `chrony`，降低 REALITY 因时间误差失败的概率
+- 🧰 **诊断脚本**：去掉 `grep -P`，兼容 Alpine/OpenRC，增加时间与日志检查
+- 📚 文档补充“端口通但连不上”根因与自检命令
 
 ### 新增 Debian 版本
 - ✨ 支持 **Debian trixie amd64 (20251224_0350)** LXD 容器平台
@@ -220,6 +231,7 @@ date
 | 问题 | 原因 | 解决方案 |
 |------|------|--------|
 | **连接失败** | Reality 时间误差 > 90s | 运行 `date` 检查，使用时间同步 |
+| **端口通但连不上** | 公钥/参数不匹配、日志被丢弃、旧进程残留、systemd 过严 | 重跑最新脚本；核对 UUID/PublicKey/ShortId/SNI；查看 `/var/log/xray.log` |
 | **频繁断连** | 内存不足 OOM | 检查 `free -m`，开启 Swap 虚拟内存 |
 | **MTU 设置失败** | 容器网络不支持修改 | **继续使用系统默认值**（脚本已优雅降级） |
 | **BBR 启用失败** | 内核不支持 BBR | **自动降级到系统默认算法**（脚本已处理） |
@@ -414,6 +426,14 @@ chmod +x /usr/local/bin/monitor.sh
 ---
 
 ## 📄 更新日志
+
+### v3.1（连通性修复版）- 2026-07-27
+- 🐛 **重点修复 Debian**：`listen 0.0.0.0` + 文件日志 + systemd 权限放宽
+- 🐛 **修复 Debian 启动失败**：`ExecStartPre=+...`、去除过严沙箱、启动前配置测试并打印 journal
+- 🐛 **修复 Alpine**：BusyBox 安全密钥提取、`xray.stop`、进程残留、chrony 时间同步
+- 🧰 **增强诊断**：兼容 OpenRC/systemd，检查时间、日志、privateKey/shortId
+- 📚 **文档**：把“端口通但连不上”说明写入更新说明与更新日志
+- 🎯 针对现象：端口可达、cron/服务正常，但 Reality 客户端无法连通
 
 ### v3.0（Debian LXD 支持版）- 2026-06-10
 - ✨ **新增 Debian trixie 支持**

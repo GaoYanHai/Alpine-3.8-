@@ -218,14 +218,20 @@ echo "✅ 密钥生成成功"
 
 # 4. 生成 Xray 配置文件（日志全关版）
 echo "正在生成配置文件..."
+# 打开 warning 日志，显式监听 0.0.0.0，便于排查“端口通但连不上”
+XRAY_LOG="/var/log/xray.log"
+touch "$XRAY_LOG" 2>/dev/null || true
+chown "$XRAY_USER:$XRAY_GROUP" "$XRAY_LOG" 2>/dev/null || true
+
 cat > "$XRAY_CONFIG" << CONF
 {
     "log": {
-        "loglevel": "none",
-        "access": "/dev/null",
-        "error": "/dev/null"
+        "loglevel": "warning",
+        "access": "$XRAY_LOG",
+        "error": "$XRAY_LOG"
     },
     "inbounds": [{
+        "listen": "0.0.0.0",
         "port": $PORT,
         "protocol": "vless",
         "settings": {
@@ -248,7 +254,10 @@ cat > "$XRAY_CONFIG" << CONF
             }
         }
     }],
-    "outbounds": [{ "protocol": "freedom" }]
+    "outbounds": [{
+        "protocol": "freedom",
+        "settings": {}
+    }]
 }
 CONF
 
@@ -258,9 +267,9 @@ if ! jq empty "$XRAY_CONFIG" 2>/dev/null; then
 fi
 echo "✅ 配置文件 JSON 格式验证通过"
 
-# 设置文件权限
-run_cmd chmod 640 "$XRAY_CONFIG"
-run_cmd chown "$XRAY_USER:$XRAY_GROUP" "$XRAY_CONFIG"
+# 设置文件权限（服务以 root 运行，640/644 均可；保留 xray 用户便于兼容旧单元）
+run_cmd chmod 644 "$XRAY_CONFIG"
+run_cmd chown root:root "$XRAY_CONFIG"
 
 # 5. 系统网络优化（Debian 兼容）
 echo "正在进行网络性能调优..."
@@ -288,27 +297,26 @@ echo "正在配置 systemd 服务..."
 cat > /etc/systemd/system/xray.service << 'SYSTEMD'
 [Unit]
 Description=Xray Reality Protocol Service
-After=network.target
+After=network-online.target
+Wants=network-online.target
 StartLimitIntervalSec=60
-StartLimitBurst=3
+StartLimitBurst=5
 
 [Service]
 Type=simple
-User=xray
-Group=xray
-ExecStartPre=/usr/local/bin/setup-xray-network.sh
+# 网络脚本需要改 MTU，必须用 root 预执行（+ 前缀）
+ExecStartPre=+/usr/local/bin/setup-xray-network.sh
+# LXD/小内存环境优先稳定性：以 root 运行，避免权限/沙箱导致“服务起不来”
 ExecStart=/usr/local/bin/xray run -c /etc/xray/config.json
 Restart=on-failure
-RestartSec=5
-StandardOutput=null
-StandardError=null
-
-# 安全设置
-ProtectSystem=strict
-ProtectHome=yes
+RestartSec=3
+LimitNOFILE=1048576
+# 控制台日志进 journal，业务日志仍由 config.json 写入 /var/log/xray.log
+StandardOutput=journal
+StandardError=journal
+# 容器场景避免过严沙箱；过严时常见现象就是 systemctl start 直接失败
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectClock=true
 
 [Install]
 WantedBy=multi-user.target
@@ -348,17 +356,44 @@ run_cmd chmod +x /usr/local/bin/setup-xray-network.sh
 
 # 8. 重新加载 systemd 并启动服务
 echo "正在启动 Xray 服务..."
+
+# 确保二进制和日志权限足够
+run_cmd chmod 755 "$XRAY_BIN"
+touch "$XRAY_LOG" 2>/dev/null || true
+chmod 666 "$XRAY_LOG" 2>/dev/null || chmod 644 "$XRAY_LOG" 2>/dev/null || true
+
+# 先做配置测试，避免 systemctl 只报模糊的 exit code
+if ! "$XRAY_BIN" run -test -c "$XRAY_CONFIG" >/tmp/xray-test.out 2>&1; then
+    echo "❌ Xray 配置测试失败，输出如下：" >&2
+    cat /tmp/xray-test.out >&2 || true
+    error_exit "Xray 配置测试失败"
+fi
+echo "✅ Xray 配置测试通过"
+
 run_cmd systemctl daemon-reload
+# 清理可能存在的失败计数
+systemctl reset-failed xray.service 2>/dev/null || true
 run_cmd systemctl enable xray.service
-run_cmd systemctl start xray.service
+
+if ! systemctl start xray.service; then
+    echo "❌ systemctl start 失败，状态与日志如下：" >&2
+    systemctl status xray.service --no-pager -l || true
+    journalctl -u xray.service -n 80 --no-pager || true
+    echo "---- /var/log/xray.log ----" >&2
+    tail -n 80 "$XRAY_LOG" 2>/dev/null || true
+    error_exit "命令执行失败: systemctl start xray.service"
+fi
 
 # 验证服务是否成功启动
 sleep 2
 if systemctl is-active --quiet xray.service; then
     echo "✅ Xray 服务已成功启动"
 else
-    echo "⚠️  警告: Xray 服务可能启动失败，检查状态："
-    systemctl status xray.service || true
+    echo "❌ Xray 服务未处于 active 状态，诊断信息：" >&2
+    systemctl status xray.service --no-pager -l || true
+    journalctl -u xray.service -n 80 --no-pager || true
+    tail -n 80 "$XRAY_LOG" 2>/dev/null || true
+    error_exit "Xray 服务启动后未保持运行"
 fi
 
 # 9. 配置定时重启任务（使用 systemd timer 替代 cron，兼容 LXD 环境）
@@ -441,6 +476,8 @@ Fingerprint: chrome
 📋 故障排查:
    • 验证服务: systemctl status xray.service
    • 查看日志: journalctl -u xray.service -n 50
+   • 文件日志: tail -n 50 /var/log/xray.log
+   • 检查时间: timedatectl || date
    • 查看配置: cat /etc/xray/config.json
    • 检查内存: free -m
    • 手动重启: systemctl restart xray.service
