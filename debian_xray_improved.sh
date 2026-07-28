@@ -436,6 +436,139 @@ validate_port() {
     [ "$p" -ge 1 ] && [ "$p" -le 65535 ]
 }
 
+
+# SOCKS5 协议本身几乎不限制账号格式；这里做“安全可用性”校验，避免弱口令公网裸奔
+# 用户名: 1-64，字母数字._-@
+# 密码: 8-128；至少包含字母+数字；允许大小写/符号；禁止与用户名相同、禁止常见弱口令
+validate_socks_username() {
+    u="$1"
+    len=$(printf %s "$u" | wc -c | tr -d ' ')
+    if [ "$len" -lt 1 ] || [ "$len" -gt 64 ]; then
+        echo "用户名长度须为 1-64 个字符（当前: $len）" >&2
+        return 1
+    fi
+    # 禁止空白和控制字符
+    if printf %s "$u" | grep -q '[[:space:]]'; then
+        echo "用户名不能包含空格/空白字符" >&2
+        return 1
+    fi
+    # 建议字符集：常见客户端兼容
+    if ! printf %s "$u" | grep -Eq '^[A-Za-z0-9._@+-]+$'; then
+        echo "用户名仅允许字母/数字/._@+-" >&2
+        return 1
+    fi
+    return 0
+}
+
+validate_socks_password() {
+    p="$1"
+    u="${2-}"
+    len=$(printf %s "$p" | wc -c | tr -d ' ')
+    if [ "$len" -lt 8 ] || [ "$len" -gt 128 ]; then
+        echo "密码长度须为 8-128 个字符（当前: $len）" >&2
+        return 1
+    fi
+    if printf %s "$p" | grep -q '[[:space:]]'; then
+        echo "密码不能包含空格/空白字符" >&2
+        return 1
+    fi
+    # 至少同时有字母和数字（不强制大小写混合，避免过于苛刻；但会提示）
+    has_alpha=0
+    has_digit=0
+    has_upper=0
+    has_lower=0
+    has_special=0
+    printf %s "$p" | grep -Eq '[A-Za-z]' && has_alpha=1
+    printf %s "$p" | grep -Eq '[0-9]' && has_digit=1
+    printf %s "$p" | grep -Eq '[A-Z]' && has_upper=1
+    printf %s "$p" | grep -Eq '[a-z]' && has_lower=1
+    printf %s "$p" | grep -Eq '[^A-Za-z0-9]' && has_special=1
+
+    if [ "$has_alpha" -ne 1 ] || [ "$has_digit" -ne 1 ]; then
+        echo "密码须同时包含字母和数字" >&2
+        return 1
+    fi
+    if [ -n "$u" ] && [ "$p" = "$u" ]; then
+        echo "密码不能与用户名相同" >&2
+        return 1
+    fi
+    # 常见弱口令黑名单（小写比较）
+    pl=$(printf %s "$p" | tr 'A-Z' 'a-z')
+    case "$pl" in
+        12345678|password|password1|qwerty123|admin123|socks123|abcdefg1|11111111|00000000|deuser0001|user1234|passw0rd)
+            echo "密码过于常见/弱，请更换" >&2
+            return 1
+            ;;
+    esac
+    # 连续相同字符过多
+    if printf %s "$p" | grep -Eq '(.)\1\1\1\1'; then
+        echo "密码包含过多连续重复字符" >&2
+        return 1
+    fi
+
+    # 非强制：给出强度提示
+    score=$((has_alpha + has_digit + has_upper + has_lower + has_special))
+    if [ "$len" -ge 12 ]; then score=$((score + 1)); fi
+    if [ "$score" -lt 4 ]; then
+        echo "提示: 建议密码含大小写+数字+符号，且不少于 12 位（当前可过校验，但偏弱）" >&2
+    fi
+    return 0
+}
+
+prompt_socks_credentials() {
+    # 交互循环直到合法；非交互则一次失败即退出
+    interactive=0
+    [ -r /dev/tty ] && interactive=1
+
+    tries=0
+    while :; do
+        tries=$((tries + 1))
+        if [ "$interactive" -eq 1 ]; then
+            if [ -z "$SOCKS_USER" ] || [ "$tries" -gt 1 ]; then
+                SOCKS_USER=$(prompt_input "SOCKS5 用户名（1-64，字母数字._@+-）" "${SOCKS_USER}")
+            fi
+            if [ -z "$SOCKS_PASS" ] || [ "$tries" -gt 1 ]; then
+                SOCKS_PASS=$(prompt_input "SOCKS5 密码（>=8，须含字母+数字）" "")
+            fi
+        fi
+
+        if [ -z "$SOCKS_USER" ] || [ -z "$SOCKS_PASS" ]; then
+            if [ "$interactive" -eq 1 ] && [ "$tries" -lt 5 ]; then
+                echo "❌ 用户名和密码都不能为空，请重试" >&2
+                continue
+            fi
+            error_exit "启用 SOCKS5 时必须提供用户名和密码（交互输入，或设置 SOCKS_USER / SOCKS_PASS）"
+        fi
+
+        user_err=""
+        pass_err=""
+        if ! user_err=$(validate_socks_username "$SOCKS_USER" 2>&1); then
+            echo "❌ 用户名不合法: $user_err" >&2
+            if [ "$interactive" -eq 1 ] && [ "$tries" -lt 5 ]; then
+                SOCKS_USER=""
+                continue
+            fi
+            error_exit "SOCKS5 用户名不合法: $user_err"
+        fi
+        if ! pass_err=$(validate_socks_password "$SOCKS_PASS" "$SOCKS_USER" 2>&1); then
+            # validate 可能同时输出提示和错误；若 return 1 则整段是失败信息
+            echo "❌ 密码不合法: $pass_err" >&2
+            if [ "$interactive" -eq 1 ] && [ "$tries" -lt 5 ]; then
+                SOCKS_PASS=""
+                continue
+            fi
+            error_exit "SOCKS5 密码不合法: $pass_err"
+        else
+            # 成功时也可能有“提示:”弱口令建议，透传
+            if [ -n "$pass_err" ]; then
+                echo "$pass_err" >&2
+            fi
+        fi
+        break
+    done
+}
+
+
 configure_socks_optional() {
     # 保留脚本开始前/外部传入的环境变量
     _socks_enable_in="${ENABLE_SOCKS:-0}"
@@ -494,16 +627,9 @@ configure_socks_optional() {
         error_exit "SOCKS5 端口不能与 Reality 端口相同 ($PORT)"
     fi
 
-    # 用户名/密码：启用则必填
-    if [ -z "$SOCKS_USER" ] && [ -r /dev/tty ]; then
-        SOCKS_USER=$(prompt_input "SOCKS5 用户名" "")
-    fi
-    if [ -z "$SOCKS_PASS" ] && [ -r /dev/tty ]; then
-        SOCKS_PASS=$(prompt_input "SOCKS5 密码" "")
-    fi
-    if [ -z "$SOCKS_USER" ] || [ -z "$SOCKS_PASS" ]; then
-        error_exit "启用 SOCKS5 时必须提供用户名和密码（交互输入，或设置 SOCKS_USER / SOCKS_PASS）"
-    fi
+    # 用户名/密码：启用则必填 + 安全校验
+    echo "账号要求: 用户名 1-64（字母数字._@+-）；密码 8-128，须含字母+数字，且不能与用户名相同"
+    prompt_socks_credentials
 
     su_esc=$(json_escape "$SOCKS_USER")
     sp_esc=$(json_escape "$SOCKS_PASS")
