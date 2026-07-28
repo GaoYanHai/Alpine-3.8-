@@ -11,6 +11,12 @@ set -u  # 未定义变量时报错
 
 # 0. 自定义基础变量
 PORT=52300
+ENABLE_SOCKS="${ENABLE_SOCKS:-0}"
+SOCKS_PORT="${SOCKS_PORT:-10808}"
+SOCKS_USER="${SOCKS_USER:-}"
+SOCKS_PASS="${SOCKS_PASS:-}"
+SOCKS_INBOUND_JSON=""
+SOCKS_INFO_TEXT=""
 SHORT_ID="0123456789abcdef"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/etc/xray/config.json"
@@ -127,14 +133,14 @@ get_public_ip() {
         "https://ipv4.icanhazip.com" \
         "https://api.ip.sb/ip"
     do
-        ip=$(curl -4 -fsS --connect-timeout 5 --max-time 8 "$url" 2>/dev/null | tr -d '\r\n' | head -n 1 || true)
+        ip=$(curl -4 -fsS --connect-timeout 5 --max-time 8 "$url" 2>/dev/null | tr -d '\n' | head -n 1 || true)
         if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "$ip"
             return 0
         fi
         ip=""
     done
-    ip=$(curl -fsS --connect-timeout 5 --max-time 8 "https://ifconfig.me" 2>/dev/null | tr -d '\r\n' | head -n 1 || true)
+    ip=$(curl -fsS --connect-timeout 5 --max-time 8 "https://ifconfig.me" 2>/dev/null | tr -d '\n' | head -n 1 || true)
     if [ -n "$ip" ]; then
         echo "$ip"
     else
@@ -365,6 +371,155 @@ assert_sni_usable() {
 }
 
 
+
+# ------------------------------------------------------------
+# 可选 SOCKS5 入站（默认关闭）
+# 交互: 询问是否启用；启用后再问端口/用户名/密码
+# 非交互: ENABLE_SOCKS=1 SOCKS_PORT=10808 SOCKS_USER=xx SOCKS_PASS=yy
+# ------------------------------------------------------------
+json_escape() {
+    printf %s "$1" | sed 's/\/\\/g; s/"/\"/g'
+}
+
+is_truthy() {
+    case "$(printf %s "$1" | tr "A-Z" "a-z")" in
+        1|y|yes|true|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+prompt_input() {
+    prompt_msg="$1"
+    default_val="${2-}"
+    ans=""
+    if [ -r /dev/tty ]; then
+        if [ -n "$default_val" ]; then
+            printf "%s [%s]: " "$prompt_msg" "$default_val" > /dev/tty
+        else
+            printf "%s: " "$prompt_msg" > /dev/tty
+        fi
+        IFS= read -r ans < /dev/tty || true
+    fi
+    if [ -z "$ans" ]; then
+        ans="$default_val"
+    fi
+    printf %s "$ans"
+}
+
+validate_port() {
+    p="$1"
+    echo "$p" | grep -Eq '^[0-9]+$' || return 1
+    [ "$p" -ge 1 ] && [ "$p" -le 65535 ]
+}
+
+configure_socks_optional() {
+    # 保留脚本开始前/外部传入的环境变量
+    _socks_enable_in="${ENABLE_SOCKS:-0}"
+    _socks_port_in="${SOCKS_PORT:-10808}"
+    _socks_user_in="${SOCKS_USER:-}"
+    _socks_pass_in="${SOCKS_PASS:-}"
+
+    ENABLE_SOCKS=0
+    SOCKS_PORT="$_socks_port_in"
+    SOCKS_USER="$_socks_user_in"
+    SOCKS_PASS="$_socks_pass_in"
+    SOCKS_INBOUND_JSON=""
+    SOCKS_INFO_TEXT=""
+
+    echo ""
+    echo "=========================================="
+    echo "可选功能: SOCKS5 入站"
+    echo "=========================================="
+    echo "说明: 与 VLESS/Reality 并存；默认不启用。"
+    echo "安全: 启用后强制用户名+密码，并尝试放行对应端口。"
+    echo ""
+
+    choice=""
+    if is_truthy "$_socks_enable_in"; then
+        choice="y"
+        echo "检测到 ENABLE_SOCKS=$_socks_enable_in，将启用 SOCKS5"
+    elif [ ! -r /dev/tty ]; then
+        choice="n"
+        echo "非交互安装且未设置 ENABLE_SOCKS，跳过 SOCKS5"
+    else
+        choice=$(prompt_input "是否启用 SOCKS5 入站？(y/N)" "N")
+    fi
+
+    if ! is_truthy "$choice"; then
+        ENABLE_SOCKS=0
+        SOCKS_INBOUND_JSON=""
+        SOCKS_INFO_TEXT=""
+        echo "➡️  不启用 SOCKS5，继续仅安装 Reality"
+        return 0
+    fi
+
+    ENABLE_SOCKS=1
+
+    # 端口：交互可改；非交互用环境变量/默认
+    if [ -r /dev/tty ] && ! is_truthy "$_socks_enable_in"; then
+        SOCKS_PORT=$(prompt_input "SOCKS5 端口" "${SOCKS_PORT:-10808}")
+    elif [ -r /dev/tty ] && [ "$_socks_port_in" = "10808" ]; then
+        # 环境只开了开关、没改端口时，仍允许确认/修改
+        SOCKS_PORT=$(prompt_input "SOCKS5 端口" "10808")
+    fi
+    SOCKS_PORT="${SOCKS_PORT:-10808}"
+    if ! validate_port "$SOCKS_PORT"; then
+        error_exit "SOCKS5 端口无效: $SOCKS_PORT"
+    fi
+    if [ "$SOCKS_PORT" = "$PORT" ]; then
+        error_exit "SOCKS5 端口不能与 Reality 端口相同 ($PORT)"
+    fi
+
+    # 用户名/密码：启用则必填
+    if [ -z "$SOCKS_USER" ] && [ -r /dev/tty ]; then
+        SOCKS_USER=$(prompt_input "SOCKS5 用户名" "")
+    fi
+    if [ -z "$SOCKS_PASS" ] && [ -r /dev/tty ]; then
+        SOCKS_PASS=$(prompt_input "SOCKS5 密码" "")
+    fi
+    if [ -z "$SOCKS_USER" ] || [ -z "$SOCKS_PASS" ]; then
+        error_exit "启用 SOCKS5 时必须提供用户名和密码（交互输入，或设置 SOCKS_USER / SOCKS_PASS）"
+    fi
+
+    su_esc=$(json_escape "$SOCKS_USER")
+    sp_esc=$(json_escape "$SOCKS_PASS")
+
+    # 前导逗号：追加到 VLESS inbound 之后
+    SOCKS_INBOUND_JSON=$(printf '%s' ",
+    {
+        \"tag\": \"socks-in\",
+        \"listen\": \"0.0.0.0\",
+        \"port\": ${SOCKS_PORT},
+        \"protocol\": \"socks\",
+        \"settings\": {
+            \"auth\": \"password\",
+            \"accounts\": [{
+                \"user\": \"${su_esc}\",
+                \"pass\": \"${sp_esc}\"
+            }],
+            \"udp\": true
+        },
+        \"sniffing\": {
+            \"enabled\": true,
+            \"destOverride\": [\"http\", \"tls\", \"quic\"]
+        }
+    }")
+
+    SOCKS_INFO_TEXT=$(printf '%s
+' \
+        "SOCKS5 已启用:" \
+        "  地址: (同服务器公网 IP)" \
+        "  端口: ${SOCKS_PORT}" \
+        "  用户: ${SOCKS_USER}" \
+        "  密码: ${SOCKS_PASS}" \
+        "  协议: socks5" \
+        "  认证: username/password" \
+        "  UDP:  true")
+
+    echo "✅ 将写入 SOCKS5 入站: 0.0.0.0:${SOCKS_PORT} (user=${SOCKS_USER})"
+}
+
+
 # 0.5 检测并设置时区和编码
 echo "正在检查时区..."
 CURRENT_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "unknown")
@@ -498,6 +653,9 @@ echo "  说明: 新版 Xray 的 Password 字段 = 客户端 PublicKey（已自�
 # 3.5 伪装目标已在 detect/assert 阶段完成严格校验
 echo "✅ 伪装目标已校验: $DEST_SITE"
 
+# 3.8 可选 SOCKS5 入站
+configure_socks_optional
+
 # 4. 生成 Xray 配置文件
 echo "正在生成配置文件..."
 touch "$XRAY_LOG" 2>/dev/null || true
@@ -537,7 +695,7 @@ cat > "$XRAY_CONFIG" << CONF
             "enabled": true,
             "destOverride": ["http", "tls", "quic"]
         }
-    }],
+    }$SOCKS_INBOUND_JSON],
     "outbounds": [{
         "protocol": "freedom",
         "settings": {}
@@ -573,6 +731,9 @@ fi
 
 # 5.5 防火墙
 open_firewall_port "$PORT"
+if [ "${ENABLE_SOCKS:-0}" = "1" ]; then
+    open_firewall_port "$SOCKS_PORT"
+fi
 
 # 6. 配置 systemd 服务
 echo "正在配置 systemd 服务..."
@@ -744,6 +905,8 @@ ShortID (sid): $SHORT_ID
 Fingerprint (fp): chrome
 网络 (Network): tcp
 
+$SOCKS_INFO_TEXT
+
 分享链接:
 $SHARE_LINK
 LINKEOF
@@ -762,6 +925,8 @@ SNI: $SNI（多地域严格校验后的最优选择）
 ShortID: $SHORT_ID
 Fingerprint: chrome
 网络 (Network): tcp
+
+$SOCKS_INFO_TEXT
 -------------------------------------------------------
 📎 一键分享链接（推荐直接导入，避免手填导致 -1ms）:
 $SHARE_LINK

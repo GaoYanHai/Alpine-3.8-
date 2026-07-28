@@ -12,6 +12,13 @@
 
 ---
 
+## 🆕 更新说明（2026-07-28c）
+
+### 新增：可选 SOCKS5 入站开关
+- 默认不启用；选 `y` 后询问端口、用户名、密码并写入配置
+- 与现有 VLESS+Reality 并存，不替换原入口
+- `curl | bash` 非交互场景可用环境变量 `ENABLE_SOCKS/SOCKS_PORT/SOCKS_USER/SOCKS_PASS`
+
 ## 🆕 更新说明（2026-07-28b）
 
 ### 重点：伪装目标（SNI/dest）严格校验
@@ -298,6 +305,35 @@ sudo sh xray-diagnostic.sh
 
 ---
 
+
+
+## 🧦 可选：SOCKS5 入站
+
+安装脚本支持**可选开关**，默认不启用：
+
+1. 运行脚本时询问：`是否启用 SOCKS5 入站？(y/N)`
+2. 选 `N`：不做任何改动，仅 Reality
+3. 选 `y`：继续询问
+   - 端口（默认 `10808`）
+   - 用户名（必填）
+   - 密码（必填）
+4. 自动写入 `/etc/xray/config.json` 的第二个 `inbounds`，并尝试放行防火墙端口
+
+### 非交互安装（适合 curl | bash）
+
+```bash
+export ENABLE_SOCKS=1
+export SOCKS_PORT=10808
+export SOCKS_USER='myuser'
+export SOCKS_PASS='mypass'
+curl -fsSL https://raw.githubusercontent.com/GaoYanHai/Alpine-3.8-/main/debian_xray_improved.sh | bash
+```
+
+### 安全建议
+- 公网暴露 SOCKS5 必须用强密码
+- 云安全组仅对可信 IP 放行 SOCKS 端口
+- 若只要本机用，可事后把 `listen` 改成 `127.0.0.1`
+
 ## 🔧 日常运维
 
 ### Alpine
@@ -382,6 +418,11 @@ A: 容器权限常见限制，脚本会降级继续；一般不导致 -1ms。
 ---
 
 ## 📜 更新日志
+
+### v3.4（2026-07-28）— 可选 SOCKS5 入站开关
+- 安装时可选择是否启用 SOCKS5（默认否）
+- 启用后交互输入端口/用户名/密码，写入 config.json
+- 自动放行 SOCKS 端口；支持 ENABLE_SOCKS 环境变量非交互安装
 
 ### v3.3（2026-07-28）— 伪装目标严格校验 + 多地域候选
 - 安装期强制校验 SNI/dest：DNS、TCP443、HTTPS 必须通过
