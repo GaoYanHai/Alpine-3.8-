@@ -329,6 +329,9 @@ export SOCKS_PASS='mypass'
 curl -fsSL https://raw.githubusercontent.com/GaoYanHai/Alpine-3.8-/main/debian_xray_improved.sh | bash
 ```
 
+### 排障
+- 若启用 SOCKS 时出现 `sed: unknown option to s`：是旧版用户名转义 bug，请拉取最新脚本重跑
+
 ### 安全建议
 - 公网暴露 SOCKS5 必须用强密码
 - 云安全组仅对可信 IP 放行 SOCKS 端口
@@ -418,6 +421,10 @@ A: 容器权限常见限制，脚本会降级继续；一般不导致 -1ms。
 ---
 
 ## 📜 更新日志
+
+### v3.4.1（2026-07-28）— 修复 SOCKS 用户名/密码转义
+- 修复启用 SOCKS5 时 `sed: unknown option to s` 导致安装中断
+- `json_escape` 改为 python/awk/shell 多级回退，不再用易碎 sed 替换
 
 ### v3.4（2026-07-28）— 可选 SOCKS5 入站开关
 - 安装时可选择是否启用 SOCKS5（默认否）

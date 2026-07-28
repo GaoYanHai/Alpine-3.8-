@@ -378,8 +378,32 @@ assert_sni_usable() {
 # 非交互: ENABLE_SOCKS=1 SOCKS_PORT=10808 SOCKS_USER=xx SOCKS_PASS=yy
 # ------------------------------------------------------------
 json_escape() {
-    printf %s "$1" | sed 's/\/\\/g; s/"/\"/g'
+    # 避免 sed s/// 在 BusyBox/部分 GNU sed 上因反斜杠分隔符解析失败
+    # 优先 python；否则 awk；再否则纯 shell
+    if command -v python3 >/dev/null 2>&1; then
+        printf %s "$1" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read())[1:-1])' 2>/dev/null && return 0
+    fi
+    if command -v python >/dev/null 2>&1; then
+        printf %s "$1" | python -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read())[1:-1])' 2>/dev/null && return 0
+    fi
+    if command -v awk >/dev/null 2>&1; then
+        printf %s "$1" | awk 'BEGIN{ORS=""} { gsub(/\/, "\\"); gsub(/"/, "\\""); print }' && return 0
+    fi
+    in="$1"
+    out=""
+    while [ -n "$in" ]; do
+        c=$(printf %s "$in" | cut -c1)
+        rest=$(printf %s "$in" | cut -c2-)
+        case "$c" in
+            \) out="$out\\" ;;
+            \") out="$out\\"" ;;
+            *) out="$out$c" ;;
+        esac
+        in="$rest"
+    done
+    printf %s "$out"
 }
+
 
 is_truthy() {
     case "$(printf %s "$1" | tr "A-Z" "a-z")" in
