@@ -223,14 +223,65 @@ echo ""
 
 # 7. SNI / dest 可达
 echo "=========================================="
-echo "7️⃣  伪装目标 SNI/dest 可达性"
+echo "7️⃣  伪装目标 SNI/dest 严格校验（-1ms 高发根因）"
 echo "=========================================="
-echo "测试 https://$SNI ..."
-if curl -fsSI --connect-timeout 5 --max-time 8 "https://$SNI" >/dev/null 2>&1; then
-    ok "SNI 站点可达"
+echo "目标: SNI=$SNI  dest=${DEST:-$SNI:443}"
+SNI_BAD=0
+if [ -z "$SNI" ] || [ "$SNI" = "unknown" ]; then
+    bad "未读到 serverNames/SNI"
+    SNI_BAD=1
 else
-    bad "SNI 站点不可达 —— REALITY 握手容易失败（客户端也可能一直失败）"
-    echo "可换 microsoft/apple/ikea 等可达域名，并同步改 dest 与 serverNames"
+    # DNS
+    if command -v nslookup >/dev/null 2>&1; then
+        if nslookup "$SNI" >/dev/null 2>&1; then
+            ok "DNS 可解析: $SNI"
+        else
+            bad "DNS 无法解析 $SNI"
+            SNI_BAD=1
+        fi
+    fi
+    # TCP 443
+    if command -v nc >/dev/null 2>&1; then
+        if nc -z -w 4 "$SNI" 443 >/dev/null 2>&1; then
+            ok "TCP 443 可达"
+        else
+            bad "TCP 443 不可达 —— Reality dest 失败会直接导致客户端 -1ms"
+            SNI_BAD=1
+        fi
+    fi
+    # HTTPS
+    CODE=$(curl -sS -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 8 -I "https://$SNI" 2>/dev/null || echo "000")
+    if [ "$CODE" != "000" ]; then
+        ok "HTTPS 有响应 (HTTP $CODE)"
+    else
+        bad "HTTPS 无响应"
+        SNI_BAD=1
+    fi
+    # TLS1.3
+    if curl -sS -o /dev/null --connect-timeout 5 --max-time 8 --tlsv1.3 -I "https://$SNI" 2>/dev/null; then
+        ok "TLS1.3 可用（Reality 推荐）"
+    else
+        warn "TLS1.3 探测失败（部分环境 curl 参数受限；建议 openssl 复核）"
+    fi
+    # HTTP2
+    if curl -sS -o /dev/null --connect-timeout 5 --max-time 8 --http2 -I "https://$SNI" 2>/dev/null; then
+        ok "HTTP/2 可用"
+    else
+        warn "HTTP/2 探测失败"
+    fi
+    if command -v openssl >/dev/null 2>&1; then
+        if echo | openssl s_client -tls1_3 -connect "$SNI:443" -servername "$SNI" >/dev/null 2>&1; then
+            ok "openssl TLS1.3 握手成功"
+        else
+            bad "openssl 无法完成 TLS1.3 握手 —— 不适合作为 Reality dest"
+            SNI_BAD=1
+        fi
+    fi
+fi
+if [ "$SNI_BAD" -eq 1 ]; then
+    echo "修复建议:"
+    echo "  1) 重跑最新安装脚本（自动从美国/欧洲/印度/俄罗斯/亚太 30 个候选中挑选可用 SNI）"
+    echo "  2) 或手动把 config.json 的 dest/serverNames 改成 VPS 能访问的站点后重启"
 fi
 echo ""
 

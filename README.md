@@ -12,6 +12,34 @@
 
 ---
 
+## 🆕 更新说明（2026-07-28b）
+
+### 重点：伪装目标（SNI/dest）严格校验
+
+确认根因后：很多 VPS「服务正常、参数也填了」，但客户端一直 `-1ms`，是因为 **Reality 回落/握手依赖的伪装站在服务器侧不可达或不合格**。  
+本次把 SNI 从“能 curl 一下就行”升级为**安装期强制校验**，不合格直接中止，避免带着坏 SNI 上线。
+
+#### 校验规则（必须通过）
+1. DNS 可解析
+2. TCP `443` 可连
+3. HTTPS 有响应（允许 301/302/403，只要 TLS 能建连）
+4. **TLS1.3 / HTTP/2** 高分优先（探测不到 TLS1.3 会降权并告警，但不一定直接淘汰该站）
+5. 全部候选在 DNS/TCP/HTTPS 层失败 → **安装失败退出**（不再静默写死坏 SNI）
+6. 选定后再做一次 **最终校验**，写入 config 前确保 dest 可用
+
+#### 新增多地域候选
+| 区域 | 示例域名 |
+|------|----------|
+| 美国/北美 | `www.microsoft.com` `www.apple.com` `www.cloudflare.com` `www.amazon.com` `www.nvidia.com` `www.intel.com` `www.adobe.com` `www.costco.com` |
+| 欧洲 | `www.ikea.com` `www.sap.com` `www.nokia.com` `www.ericsson.com` `www.bmw.com` `www.dyson.co.uk` `www.sony.co.jp` `www.volkswagen.com` |
+| 印度 | `www.infosys.com` `www.tcs.com` `www.airtel.in` `www.flipkart.com` `www.india.gov.in` |
+| 俄罗斯 | `www.yandex.ru` `www.vk.com` `www.mail.ru` `www.sberbank.ru` `www.wildberries.ru` |
+| 亚太兜底 | `www.samsung.com` `www.shopee.sg` `www.toyota.com` `www.singaporeair.com` |
+
+脚本会在以上候选中自动挑选 **评分最高且延迟较低** 的目标；Alpine 与 Debian 均已接入。
+
+---
+
 ## 🆕 更新说明（2026-07-28）
 
 ### 重点修复：客户端延迟一直是 `-1ms`
@@ -234,7 +262,22 @@ ss -tlnp | grep 52300
 # 若只有 127.0.0.1:52300，外网必 -1ms
 ```
 
-#### 6) 时间与伪装站
+#### 6) 伪装目标 SNI/dest（本次确认的高发根因）
+
+服务器必须能访问 `https://<SNI>`，且尽量 TLS1.3：
+
+```bash
+SNI=$(sed -n 's/.*"serverNames"[[:space:]]*:[[:space:]]*\[[[:space:]]*"\([^"]*\)".*/\1/p' /etc/xray/config.json | head -1)
+echo "SNI=$SNI"
+nslookup "$SNI"
+nc -vz "$SNI" 443
+curl -I --tlsv1.3 https://"$SNI"
+echo | openssl s_client -tls1_3 -connect "$SNI:443" -servername "$SNI" >/dev/null && echo TLS13_OK
+```
+
+若这里失败，客户端会稳定 `-1ms`。解决：重跑最新脚本自动换可用 SNI，或手动改 `dest`/`serverNames` 后重启。
+
+#### 7) 时间同步
 
 ```bash
 date
@@ -339,6 +382,14 @@ A: 容器权限常见限制，脚本会降级继续；一般不导致 -1ms。
 ---
 
 ## 📜 更新日志
+
+### v3.3（2026-07-28）— 伪装目标严格校验 + 多地域候选
+- 安装期强制校验 SNI/dest：DNS、TCP443、HTTPS 必须通过
+- TLS1.3/H2 评分优选；最终校验通过后才写入配置
+- 新增多地域候选：美国 / 欧洲 / 印度 / 俄罗斯 / 亚太（共 30 个）
+- Alpine 同步接入自动选 SNI（不再写死 ikea）
+- 全部候选失败则中止安装，避免带着坏伪装目标上线导致 -1ms
+- 诊断脚本增强 SNI/dest 逐项检查
 
 ### v3.2（2026-07-28）— 针对延迟 -1ms
 - 修复/增强 x25519 公钥解析（Password / PublicKey / 防 Hash32）

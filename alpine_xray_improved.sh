@@ -12,8 +12,42 @@ set -u  # 未定义变量时报错
 # 0. 自定义基础变量
 PORT=52300
 SHORT_ID="0123456789abcdef"
-DEST_SITE="www.ikea.com:443"
-SNI="www.ikea.com"
+DEST_SITE=""
+SNI=""
+# 多地域 Reality 伪装目标候选（美国/欧洲/印度/俄罗斯/亚太）
+# 每行: domain|region
+SNI_CANDIDATES="
+www.microsoft.com|US
+www.apple.com|US
+www.cloudflare.com|US
+www.amazon.com|US
+www.nvidia.com|US
+www.intel.com|US
+www.adobe.com|US
+www.costco.com|US
+www.ikea.com|EU
+www.sap.com|EU
+www.nokia.com|EU
+www.ericsson.com|EU
+www.bmw.com|EU
+www.dyson.co.uk|EU
+www.sony.co.jp|EU
+www.volkswagen.com|EU
+www.infosys.com|IN
+www.tcs.com|IN
+www.airtel.in|IN
+www.flipkart.com|IN
+www.india.gov.in|IN
+www.yandex.ru|RU
+www.vk.com|RU
+www.mail.ru|RU
+www.sberbank.ru|RU
+www.wildberries.ru|RU
+www.samsung.com|APAC
+www.shopee.sg|APAC
+www.toyota.com|APAC
+www.singaporeair.com|APAC
+"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/etc/xray/config.json"
 XRAY_DIR="/etc/xray"
@@ -157,10 +191,183 @@ urlencode() {
     printf %s "$1" | sed 's/+/%2B/g; s/\//%2F/g; s/=/%3D/g'
 }
 
+
+
+# ------------------------------------------------------------
+# Reality 伪装目标（SNI/dest）严格校验 - BusyBox/POSIX sh
+# ------------------------------------------------------------
+probe_sni_target() {
+    sni="$1"
+    region="${2:-unknown}"
+    score=0
+    tls13=0
+    h2=0
+    connect_time="9999"
+    http_code="000"
+    curl_out=""
+
+    if command -v nslookup >/dev/null 2>&1; then
+        if ! nslookup "$sni" >/dev/null 2>&1; then
+            echo "FAIL dns region=$region sni=$sni" >&2
+            return 1
+        fi
+        score=$((score + 10))
+    elif command -v getent >/dev/null 2>&1; then
+        if ! getent ahosts "$sni" >/dev/null 2>&1; then
+            echo "FAIL dns region=$region sni=$sni" >&2
+            return 1
+        fi
+        score=$((score + 10))
+    else
+        score=$((score + 5))
+    fi
+
+    if command -v nc >/dev/null 2>&1; then
+        if ! nc -z -w 3 "$sni" 443 >/dev/null 2>&1; then
+            echo "FAIL tcp443 region=$region sni=$sni" >&2
+            return 1
+        fi
+        score=$((score + 20))
+    fi
+
+    curl_out=$(curl -sS -o /dev/null -w "%{http_code} %{time_connect}" \
+        --connect-timeout 3 --max-time 6 -I "https://${sni}" 2>/dev/null || echo "000 9999")
+    http_code=$(echo "$curl_out" | awk '{print $1}')
+    connect_time=$(echo "$curl_out" | awk '{print $2}')
+    if [ -z "$http_code" ] || [ "$http_code" = "000" ]; then
+        echo "FAIL https region=$region sni=$sni code=000" >&2
+        return 1
+    fi
+    score=$((score + 30))
+
+    if curl -sS -o /dev/null --connect-timeout 3 --max-time 6 --tlsv1.3 -I "https://${sni}" 2>/dev/null; then
+        tls13=1
+        score=$((score + 30))
+    fi
+    if curl -sS -o /dev/null --connect-timeout 3 --max-time 6 --http2 -I "https://${sni}" 2>/dev/null; then
+        h2=1
+        score=$((score + 15))
+    fi
+
+    if command -v openssl >/dev/null 2>&1; then
+        if echo | openssl s_client -tls1_3 -connect "${sni}:443" -servername "$sni" >/dev/null 2>&1; then
+            score=$((score + 15))
+            tls13=1
+        fi
+    fi
+    if [ "$tls13" -eq 0 ]; then
+        echo "WARN weak-tls region=$region sni=$sni (no TLS1.3 detected, deprioritized)" >&2
+    fi
+
+    ms=$(awk -v t="$connect_time" 'BEGIN{printf "%d", (t+0)*1000}' 2>/dev/null || echo 9999)
+    echo "OK region=$region sni=$sni code=$http_code latency_ms=$ms tls13=$tls13 h2=$h2 score=$score" >&2
+    echo "${score}|${connect_time}|${sni}|${region}|${tls13}|${h2}|${http_code}"
+    return 0
+}
+
+sni_region_of() {
+    case "$1" in
+        www.microsoft.com|www.apple.com|www.cloudflare.com|www.amazon.com|www.nvidia.com|www.intel.com|www.adobe.com|www.costco.com) echo US ;;
+        www.ikea.com|www.sap.com|www.nokia.com|www.ericsson.com|www.bmw.com|www.dyson.co.uk|www.sony.co.jp|www.volkswagen.com) echo EU ;;
+        www.infosys.com|www.tcs.com|www.airtel.in|www.flipkart.com|www.india.gov.in) echo IN ;;
+        www.yandex.ru|www.vk.com|www.mail.ru|www.sberbank.ru|www.wildberries.ru) echo RU ;;
+        www.samsung.com|www.shopee.sg|www.toyota.com|www.singaporeair.com) echo APAC ;;
+        *) echo OTHER ;;
+    esac
+}
+
+detect_best_sni() {
+    echo "正在严格检测多地域伪装目标（SNI/dest）..." >&2
+    echo "规则: DNS + TCP443 + HTTPS 必须通过；TLS1.3/H2 高分优先；再比延迟" >&2
+    echo "区域覆盖: US / EU / IN / RU / APAC" >&2
+    echo "" >&2
+
+    result_file="/tmp/sni-detect-$$.txt"
+    : > "$result_file"
+    ok_count=0
+    fail_count=0
+
+    # 用 for 遍历，避免管道子 shell 丢结果；结果落临时文件
+    OLDIFS=$IFS
+    IFS='
+'
+    for line in $SNI_CANDIDATES; do
+        IFS=$OLDIFS
+        sni=$(echo "$line" | cut -d'|' -f1 | tr -d ' \r')
+        region=$(echo "$line" | cut -d'|' -f2 | tr -d ' \r')
+        [ -z "$sni" ] && continue
+        [ -z "$region" ] && region=$(sni_region_of "$sni")
+        if out=$(probe_sni_target "$sni" "$region"); then
+            echo "$out" >> "$result_file"
+            ok_count=$((ok_count + 1))
+        else
+            fail_count=$((fail_count + 1))
+        fi
+        IFS='
+'
+    done
+    IFS=$OLDIFS
+
+    echo "" >&2
+    echo "检测汇总: 通过 $ok_count / 失败 $fail_count" >&2
+
+    if [ ! -s "$result_file" ]; then
+        echo "❌ 所有候选伪装目标均未通过校验" >&2
+        echo "   无可用 SNI/dest 时 Reality 会握手失败，客户端表现为延迟 -1ms" >&2
+        rm -f "$result_file"
+        return 1
+    fi
+
+    best=$(awk -F'|' '
+        BEGIN { best_score=-1; best_lat=99999; best_sni=""; best_region=""; best_tls=""; best_h2=""; }
+        {
+          score=$1+0; lat=$2+0; sni=$3; region=$4; tls=$5; h2=$6;
+          if (score>best_score || (score==best_score && lat<best_lat)) {
+            best_score=score; best_lat=lat; best_sni=sni; best_region=region; best_tls=tls; best_h2=h2;
+          }
+        }
+        END {
+          if (best_sni != "") printf "%s %d %s %s %s %s\n", best_sni, best_score, best_lat, best_region, best_tls, best_h2
+        }
+    ' "$result_file")
+    rm -f "$result_file"
+
+    if [ -z "$best" ]; then
+        echo "❌ 未能选定伪装目标" >&2
+        return 1
+    fi
+
+    best_sni=$(echo "$best" | awk '{print $1}')
+    best_score=$(echo "$best" | awk '{print $2}')
+    best_lat=$(echo "$best" | awk '{print $3}')
+    best_region=$(echo "$best" | awk '{print $4}')
+    best_tls=$(echo "$best" | awk '{print $5}')
+    best_h2=$(echo "$best" | awk '{print $6}')
+    ms=$(awk -v t="$best_lat" 'BEGIN{printf "%.0f", (t+0)*1000}')
+    echo "✅ 选定伪装目标: $best_sni (region=$best_region score=$best_score tls13=$best_tls h2=$best_h2 latency≈${ms}ms)" >&2
+    echo "$best_sni"
+    return 0
+}
+
+assert_sni_usable() {
+    sni="$1"
+    region=$(sni_region_of "$sni")
+    echo "正在对选定 SNI 做最终校验: $sni ($region)" >&2
+    if ! result=$(probe_sni_target "$sni" "$region"); then
+        error_exit "选定伪装目标 $sni 最终校验失败（会导致客户端延迟 -1ms）"
+    fi
+    tls13=$(echo "$result" | cut -d'|' -f5)
+    if [ "$tls13" != "1" ]; then
+        echo "⚠️  警告: $sni 未探测到 TLS1.3，Reality 兼容性可能较差；建议换候选站" >&2
+    fi
+    echo "✅ 最终校验通过: $sni" >&2
+}
+
+
 # 1. 环境准备与依赖安装
 echo "正在安装基础依赖..."
 run_cmd apk update
-run_cmd apk add curl gcompat ca-certificates unzip openrc iproute2 chrony
+run_cmd apk add curl gcompat ca-certificates unzip openrc iproute2 chrony openssl bind-tools
 
 # 创建必要目录
 run_cmd mkdir -p "$XRAY_DIR" "$(dirname "$XRAY_BIN")" /var/log /etc/local.d
@@ -242,22 +449,14 @@ echo "  PrivateKey 长度: $(printf %s "$PRIV_KEY" | wc -c | tr -d ' ')"
 echo "  PublicKey  长度: $(printf %s "$PUB_KEY" | wc -c | tr -d ' ')"
 echo "  说明: 新版 Xray 的 Password 字段 = 客户端 PublicKey（已自动映射）"
 
-# 3.5 检查伪装站是否可达（REALITY 回落依赖 dest）
-echo "正在检查伪装目标 $DEST_SITE ..."
-DEST_HOST=${DEST_SITE%:*}
-if command -v nc >/dev/null 2>&1; then
-    if nc -z -w 5 "$DEST_HOST" 443 2>/dev/null; then
-        echo "✅ 伪装目标 TCP 443 可达"
-    else
-        echo "⚠️  无法连通 $DEST_HOST:443（REALITY 可能握手失败，建议更换 SNI/dest）"
-    fi
-else
-    if curl -fsSI --connect-timeout 5 --max-time 8 "https://$DEST_HOST" >/dev/null 2>&1; then
-        echo "✅ 伪装目标 HTTPS 可达"
-    else
-        echo "⚠️  无法访问 https://$DEST_HOST （REALITY 可能异常）"
-    fi
+# 3.5 多地域伪装目标严格检测（避免 SNI 不可达导致客户端 -1ms）
+echo "正在选择并校验 Reality 伪装目标..."
+if ! SNI=$(detect_best_sni); then
+    error_exit "没有可用的 Reality 伪装目标（SNI/dest）。请检查 VPS 出站 443/DNS 后重试"
 fi
+assert_sni_usable "$SNI"
+DEST_SITE="${SNI}:443"
+echo "将使用: SNI=$SNI  DEST=$DEST_SITE  region=$(sni_region_of "$SNI")"
 
 # 4. 生成 Xray 配置文件
 # 说明：
@@ -478,7 +677,7 @@ cat > "$SHARE_FILE" << LINKEOF
 用户 ID (UUID): $USER_UUID
 流控 (Flow): xtls-rprx-vision
 传输安全 (Security): reality
-SNI: $SNI
+SNI: $SNI（多地域严格校验后的最优选择）
 公钥 (PublicKey / pbk): $PUB_KEY
 ShortID (sid): $SHORT_ID
 Fingerprint (fp): chrome

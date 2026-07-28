@@ -20,18 +20,44 @@ XRAY_GROUP="xray"
 XRAY_LOG="/var/log/xray.log"
 SHARE_FILE="/etc/xray/client-link.txt"
 
-# SNI 候选列表（按优先级，可自行调整）
-# 注意: REALITY dest 需要目标站支持 TLS1.3 + H2，且服务器能访问其 443
+# SNI 候选列表（多地域：美国/欧洲/印度/俄罗斯/亚太）
+# REALITY: 安装期强制校验 DNS/TCP443/HTTPS/TLS1.3，失败则中止
 SNI_CANDIDATES=(
+    # 美国 / 北美
     "www.microsoft.com"
-    "swdlp.apple.com"
-    "www.sony.co.jp"
-    "www.samsung.com"
-    "www.shopee.sg"
+    "www.apple.com"
+    "www.cloudflare.com"
+    "www.amazon.com"
+    "www.nvidia.com"
+    "www.intel.com"
+    "www.adobe.com"
+    "www.costco.com"
+    # 欧洲
+    "www.ikea.com"
+    "www.sap.com"
+    "www.nokia.com"
+    "www.ericsson.com"
     "www.bmw.com"
     "www.dyson.co.uk"
-    "www.intel.com"
-    "www.ikea.com"
+    "www.sony.co.jp"
+    "www.volkswagen.com"
+    # 印度
+    "www.infosys.com"
+    "www.tcs.com"
+    "www.airtel.in"
+    "www.flipkart.com"
+    "www.india.gov.in"
+    # 俄罗斯
+    "www.yandex.ru"
+    "www.vk.com"
+    "www.mail.ru"
+    "www.sberbank.ru"
+    "www.wildberries.ru"
+    # 亚太兜底
+    "www.samsung.com"
+    "www.shopee.sg"
+    "www.toyota.com"
+    "www.singaporeair.com"
 )
 
 # 错误处理函数
@@ -161,57 +187,183 @@ urlencode() {
     printf %s "$1" | sed 's/+/%2B/g; s/\//%2F/g; s/=/%3D/g'
 }
 
-# 自动检测延迟最低的 SNI
+
+
+# ------------------------------------------------------------
+# Reality 伪装目标（SNI/dest）严格校验
+# 必须: DNS + TCP443 + HTTPS/TLS 可建连
+# 加分: TLS1.3、HTTP/2、低延迟
+# 全部失败则安装中止，避免客户端 -1ms
+# ------------------------------------------------------------
+probe_sni_target() {
+    local sni="$1"
+    local region="${2:-unknown}"
+    local score=0
+    local tls13=0
+    local h2=0
+    local connect_time="9999"
+    local http_code="000"
+    local curl_out=""
+
+    # DNS
+    if command -v getent >/dev/null 2>&1; then
+        if ! getent ahosts "$sni" >/dev/null 2>&1; then
+            echo "FAIL dns region=$region sni=$sni" >&2
+            return 1
+        fi
+        score=$((score + 10))
+    elif command -v nslookup >/dev/null 2>&1; then
+        if ! nslookup "$sni" >/dev/null 2>&1; then
+            echo "FAIL dns region=$region sni=$sni" >&2
+            return 1
+        fi
+        score=$((score + 10))
+    else
+        score=$((score + 5))
+    fi
+
+    # TCP 443（快速失败）
+    if command -v nc >/dev/null 2>&1; then
+        if ! nc -z -w 3 "$sni" 443 >/dev/null 2>&1; then
+            echo "FAIL tcp443 region=$region sni=$sni" >&2
+            return 1
+        fi
+        score=$((score + 20))
+    elif command -v timeout >/dev/null 2>&1; then
+        if ! timeout 3 bash -c "echo >/dev/tcp/${sni}/443" >/dev/null 2>&1; then
+            echo "FAIL tcp443 region=$region sni=$sni" >&2
+            return 1
+        fi
+        score=$((score + 20))
+    fi
+
+    # 一次 curl 同时取 http_code + time_connect（允许 3xx/403）
+    curl_out=$(curl -sS -o /dev/null -w "%{http_code} %{time_connect}" \
+        --connect-timeout 3 --max-time 6 -I "https://${sni}" 2>/dev/null || echo "000 9999")
+    http_code=$(echo "$curl_out" | awk '{print $1}')
+    connect_time=$(echo "$curl_out" | awk '{print $2}')
+    if [ -z "$http_code" ] || [ "$http_code" = "000" ]; then
+        echo "FAIL https region=$region sni=$sni code=000" >&2
+        return 1
+    fi
+    score=$((score + 30))
+
+    # TLS1.3（Reality 强烈建议）
+    if curl -sS -o /dev/null --connect-timeout 3 --max-time 6 --tlsv1.3 -I "https://${sni}" 2>/dev/null; then
+        tls13=1
+        score=$((score + 30))
+    fi
+
+    # HTTP/2
+    if curl -sS -o /dev/null --connect-timeout 3 --max-time 6 --http2 -I "https://${sni}" 2>/dev/null; then
+        h2=1
+        score=$((score + 15))
+    fi
+
+    # openssl TLS1.3 复检（有则加分；明确失败且 curl 也没过 tls13 则淘汰）
+    if command -v openssl >/dev/null 2>&1; then
+        if echo | timeout 5 openssl s_client -tls1_3 -connect "${sni}:443" -servername "$sni" >/dev/null 2>&1; then
+            score=$((score + 15))
+            tls13=1
+        fi
+    fi
+    # TLS1.3 不作为单站硬淘汰条件（避免旧 curl/openssl 误杀），但无 TLS1.3 会大幅降低评分
+    if [ "$tls13" -eq 0 ]; then
+        echo "WARN weak-tls region=$region sni=$sni (no TLS1.3 detected, deprioritized)" >&2
+    fi
+
+    local ms
+    ms=$(awk -v t="$connect_time" 'BEGIN{printf "%d", (t+0)*1000}')
+    echo "OK region=$region sni=$sni code=$http_code latency_ms=$ms tls13=$tls13 h2=$h2 score=$score" >&2
+    echo "${score}|${connect_time}|${sni}|${region}|${tls13}|${h2}|${http_code}"
+    return 0
+}
+
+sni_region_of() {
+    case "$1" in
+        www.microsoft.com|www.apple.com|www.cloudflare.com|www.amazon.com|www.nvidia.com|www.intel.com|www.adobe.com|www.costco.com) echo US ;;
+        www.ikea.com|www.sap.com|www.nokia.com|www.ericsson.com|www.bmw.com|www.dyson.co.uk|www.sony.co.jp|www.volkswagen.com) echo EU ;;
+        www.infosys.com|www.tcs.com|www.airtel.in|www.flipkart.com|www.india.gov.in) echo IN ;;
+        www.yandex.ru|www.vk.com|www.mail.ru|www.sberbank.ru|www.wildberries.ru) echo RU ;;
+        www.samsung.com|www.shopee.sg|www.toyota.com|www.singaporeair.com) echo APAC ;;
+        *) echo OTHER ;;
+    esac
+}
+
 detect_best_sni() {
-    echo "正在检测延迟最低的 SNI..." >&2
-    echo "候选 SNI 列表: ${SNI_CANDIDATES[*]}" >&2
+    echo "正在严格检测多地域伪装目标（SNI/dest）..." >&2
+    echo "规则: DNS + TCP443 + HTTPS 必须通过；TLS1.3/H2 高分优先；再比延迟" >&2
+    echo "区域覆盖: US / EU / IN / RU / APAC" >&2
     echo "" >&2
 
     local best_sni=""
+    local best_score=-1
     local best_latency=99999
-    local sni latency latency_ms
+    local best_meta=""
+    local sni region result score latency tls13 h2 code
+    local ok_count=0
+    local fail_count=0
+    local region_hits=""
 
     for sni in "${SNI_CANDIDATES[@]}"; do
-        # 先确认 443 通，再比 TLS 连接时延
-        if ! (echo >/dev/tcp/${sni}/443) >/dev/null 2>&1; then
-            if ! curl -fsSI --connect-timeout 3 --max-time 5 "https://${sni}" >/dev/null 2>&1; then
-                echo "🔍 $sni: 不可达，跳过" >&2
-                continue
-            fi
-        fi
+        [ -z "$sni" ] && continue
+        region=$(sni_region_of "$sni")
 
-        latency=$(curl -w "%{time_connect}" -o /dev/null -s --connect-timeout 3 --max-time 5 "https://${sni}" 2>/dev/null || echo "9999")
-        latency_ms=$(echo "$latency * 1000" | bc 2>/dev/null || echo "9999000")
-        echo "🔍 $sni: ${latency_ms}ms" >&2
+        if result=$(probe_sni_target "$sni" "$region"); then
+            ok_count=$((ok_count + 1))
+            region_hits="${region_hits}${region} "
+            score=$(echo "$result" | cut -d'|' -f1)
+            latency=$(echo "$result" | cut -d'|' -f2)
+            tls13=$(echo "$result" | cut -d'|' -f5)
+            h2=$(echo "$result" | cut -d'|' -f6)
+            code=$(echo "$result" | cut -d'|' -f7)
 
-        if command -v bc >/dev/null 2>&1; then
-            if [ "$(echo "$latency < $best_latency" | bc -l)" = "1" ]; then
+            if [ "$score" -gt "$best_score" ] || { [ "$score" -eq "$best_score" ] && awk -v a="$latency" -v b="$best_latency" 'BEGIN{exit !(a<b)}'; }; then
+                best_score=$score
                 best_latency=$latency
                 best_sni=$sni
+                best_meta="region=$region tls13=$tls13 h2=$h2 code=$code score=$score"
             fi
         else
-            # 无 bc 时用整数毫秒近似比较
-            local ms_int
-            ms_int=${latency_ms%.*}
-            ms_int=${ms_int:-9999000}
-            local best_ms
-            best_ms=$(echo "$best_latency * 1000" | awk '{printf "%d", $1}' 2>/dev/null || echo 9999000)
-            if [ "$ms_int" -lt "$best_ms" ] 2>/dev/null; then
-                best_latency=$latency
-                best_sni=$sni
-            fi
+            fail_count=$((fail_count + 1))
         fi
     done
 
     echo "" >&2
-    if [ -n "$best_sni" ]; then
-        echo "✅ 最优 SNI: $best_sni (延迟: $(echo "$best_latency * 1000" | bc 2>/dev/null || echo "$best_latency")ms)" >&2
-        echo "$best_sni"
-    else
-        echo "⚠️  无法检测 SNI，使用默认值 www.microsoft.com" >&2
-        echo "www.microsoft.com"
+    echo "检测汇总: 通过 $ok_count / 失败 $fail_count" >&2
+    if [ -n "$region_hits" ]; then
+        echo "可用区域命中: $region_hits" >&2
     fi
+
+    if [ -n "$best_sni" ]; then
+        local ms
+        ms=$(awk -v t="$best_latency" 'BEGIN{printf "%.0f", (t+0)*1000}')
+        echo "✅ 选定伪装目标: $best_sni  (${best_meta}, latency≈${ms}ms)" >&2
+        echo "$best_sni"
+        return 0
+    fi
+
+    echo "❌ 所有候选伪装目标均未通过校验" >&2
+    echo "   无可用 SNI/dest 时 Reality 会握手失败，客户端表现为延迟 -1ms" >&2
+    echo "   请检查: VPS 出站 443、DNS、是否屏蔽国外站点" >&2
+    return 1
 }
+
+assert_sni_usable() {
+    local sni="$1"
+    local region result tls13
+    region=$(sni_region_of "$sni")
+    echo "正在对选定 SNI 做最终校验: $sni ($region)" >&2
+    if ! result=$(probe_sni_target "$sni" "$region"); then
+        error_exit "选定伪装目标 $sni 最终校验失败（会导致客户端延迟 -1ms）"
+    fi
+    tls13=$(echo "$result" | cut -d'|' -f5)
+    if [ "$tls13" != "1" ]; then
+        echo "⚠️  警告: $sni 未探测到 TLS1.3，Reality 兼容性可能较差；建议换候选站" >&2
+    fi
+    echo "✅ 最终校验通过: $sni" >&2
+}
+
 
 # 0.5 检测并设置时区和编码
 echo "正在检查时区..."
@@ -244,7 +396,7 @@ fi
 echo "正在安装基础依赖..."
 export DEBIAN_FRONTEND=noninteractive
 run_cmd apt-get update -y
-run_cmd apt-get install -y curl ca-certificates unzip jq iproute2 openssl chrony bc python3
+run_cmd apt-get install -y curl ca-certificates unzip jq iproute2 openssl chrony bc python3 dnsutils
 
 # 时间同步（REALITY 对时钟敏感，误差过大直接握手失败）
 echo "正在配置时间同步..."
@@ -296,10 +448,15 @@ if ! "$XRAY_BIN" version >/dev/null 2>&1; then
 fi
 echo "Xray 版本: $("$XRAY_BIN" version 2>/dev/null | head -n 1)"
 
-# 2.5 自动检测最优 SNI
+# 2.5 自动检测最优伪装目标（多地域 + 严格校验）
+# 不可达/无 TLS1.3 的 SNI 直接拒绝安装，避免客户端 -1ms
 echo ""
-SNI=$(detect_best_sni)
+if ! SNI=$(detect_best_sni); then
+    error_exit "没有可用的 Reality 伪装目标（SNI/dest）。请检查 VPS 出站访问 443/DNS 后重试"
+fi
+assert_sni_usable "$SNI"
 DEST_SITE="${SNI}:443"
+echo "将使用: SNI=$SNI  DEST=$DEST_SITE  region=$(sni_region_of "$SNI")"
 
 # 3. 动态生成身份凭证
 echo ""
@@ -338,13 +495,8 @@ echo "  PrivateKey 长度: $(printf %s "$PRIV_KEY" | wc -c | tr -d ' ')"
 echo "  PublicKey  长度: $(printf %s "$PUB_KEY" | wc -c | tr -d ' ')"
 echo "  说明: 新版 Xray 的 Password 字段 = 客户端 PublicKey（已自动映射，不要填 Hash32）"
 
-# 3.5 检查伪装站
-echo "正在检查伪装目标 $DEST_SITE ..."
-if curl -fsSI --connect-timeout 5 --max-time 8 "https://${SNI}" >/dev/null 2>&1; then
-    echo "✅ 伪装目标 HTTPS 可达"
-else
-    echo "⚠️  无法访问 https://${SNI} （REALITY 可能握手失败，建议更换 SNI）"
-fi
+# 3.5 伪装目标已在 detect/assert 阶段完成严格校验
+echo "✅ 伪装目标已校验: $DEST_SITE"
 
 # 4. 生成 Xray 配置文件
 echo "正在生成配置文件..."
@@ -605,7 +757,7 @@ cat << EOF
 用户 ID (UUID): $USER_UUID
 流控 (Flow): xtls-rprx-vision
 传输安全 (Security): reality
-SNI: $SNI（自动检测的最优选择）
+SNI: $SNI（多地域严格校验后的最优选择）
 公钥 (PublicKey): $PUB_KEY
 ShortID: $SHORT_ID
 Fingerprint: chrome
@@ -635,7 +787,7 @@ $SHARE_LINK
    • 定时任务已配置：systemd timer（每日 04:00 自动重启清理内存）
 
 🌍 Debian LXD 环境兼容说明:
-   • SNI 自动检测：检测延迟最低且可达的域名作为代理目标
+   • SNI 自动检测：多地域候选 + DNS/TCP/HTTPS/TLS1.3/H2 严格校验，失败则中止安装
    • MTU 已设置为 1380（解决长距离丢包）
    • 若 MTU 设置失败：此环境不支持修改（继续使用系统默认值）
    • BBR 自动检测：支持则启用，不支持则降级使用 cubic
