@@ -1,247 +1,374 @@
-#!/bin/bash
+#!/bin/sh
 
 # ====================================================
 # Xray REALITY 诊断脚本
-# 用于快速排查连接超时问题
+# 重点排查：客户端延迟一直 -1ms / 超时 / 端口通但连不上
+# 兼容: Alpine(OpenRC) + Debian(systemd)
 # ====================================================
 
-echo "=========================================="
-echo "🔍 Xray REALITY 诊断工具"
-echo "=========================================="
-echo ""
-
-# 颜色输出
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# 获取配置（兼容 BusyBox，不使用 grep -P）
-XRAY_CONFIG="/etc/xray/config.json"
-XRAY_LOG="/var/log/xray.log"
+echo "=========================================="
+echo "🔍 Xray REALITY 诊断工具"
+echo "   目标现象: 客户端延迟 = -1ms / 连接失败"
+echo "=========================================="
+echo ""
+
+XRAY_CONFIG="${XRAY_CONFIG:-/etc/xray/config.json}"
+XRAY_LOG="${XRAY_LOG:-/var/log/xray.log}"
+SHARE_FILE="${SHARE_FILE:-/etc/xray/client-link.txt}"
+SCORE_OK=0
+SCORE_WARN=0
+SCORE_BAD=0
+
+ok() { echo -e "${GREEN}✅ $1${NC}"; SCORE_OK=$((SCORE_OK + 1)); }
+warn() { echo -e "${YELLOW}⚠️  $1${NC}"; SCORE_WARN=$((SCORE_WARN + 1)); }
+bad() { echo -e "${RED}❌ $1${NC}"; SCORE_BAD=$((SCORE_BAD + 1)); }
+
+if [ ! -f "$XRAY_CONFIG" ]; then
+    bad "未找到配置文件: $XRAY_CONFIG"
+    echo "请确认已运行安装脚本，或 export XRAY_CONFIG=/path/to/config.json"
+    exit 1
+fi
+
 XRAY_PORT=$(sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$XRAY_CONFIG" | head -1)
 SNI=$(sed -n 's/.*"serverNames"[[:space:]]*:[[:space:]]*\[[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
 PRIV_KEY=$(sed -n 's/.*"privateKey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
 SHORT_ID=$(sed -n 's/.*"shortIds"[[:space:]]*:[[:space:]]*\[[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
+# shortIds 可能以 "" 开头，再取下一个非空
+if [ -z "$SHORT_ID" ]; then
+    SHORT_ID=$(grep -o '"shortIds"[[:space:]]*:[[:space:]]*\[[^]]*\]' "$XRAY_CONFIG" | head -1 | grep -o '"[0-9a-fA-F]*"' | tr -d '"' | grep -v '^$' | head -1)
+fi
+DEST=$(sed -n 's/.*"dest"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
+UUID=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
+LISTEN=$(sed -n 's/.*"listen"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
+FLOW=$(sed -n 's/.*"flow"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
 
-echo "📋 基本信息"
-echo "配置文件: $XRAY_CONFIG"
-echo "监听端口: $XRAY_PORT"
-echo "SNI: $SNI"
+[ -z "$XRAY_PORT" ] && XRAY_PORT="52300"
+[ -z "$SNI" ] && SNI="unknown"
+[ -z "$LISTEN" ] && LISTEN="(未显式配置，默认 0.0.0.0)"
+
+echo "配置摘要"
+echo "  配置文件: $XRAY_CONFIG"
+echo "  监听: $LISTEN"
+echo "  端口: $XRAY_PORT"
+echo "  UUID: ${UUID:-未读到}"
+echo "  Flow: ${FLOW:-未读到}"
+echo "  SNI: $SNI"
+echo "  dest: ${DEST:-未读到}"
+echo "  ShortId: ${SHORT_ID:-未读到}"
+echo "  PrivateKey 长度: $(printf %s "$PRIV_KEY" | wc -c | tr -d ' ')"
 echo ""
 
-# 1. 检查 Xray 进程（兼容 systemd / OpenRC）
+# 1. 进程 / 服务状态
 echo "=========================================="
-echo "1️⃣  检查 Xray 进程状态"
+echo "1️⃣  服务/进程状态"
 echo "=========================================="
-XRAY_RUNNING=0
 if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^xray.service'; then
     if systemctl is-active --quiet xray.service; then
-        echo -e "${GREEN}✅ Xray systemd 服务正在运行${NC}"
-        systemctl status xray.service | head -10
-        XRAY_RUNNING=1
+        ok "systemd: xray.service 为 active"
     else
-        echo -e "${RED}❌ Xray systemd 服务未运行${NC}"
-        echo "尝试启动: systemctl start xray.service"
+        bad "systemd: xray.service 未运行"
+        systemctl status xray.service --no-pager -l 2>/dev/null | head -n 20 || true
     fi
-elif pgrep -f "xray run" >/dev/null 2>&1 || ps 2>/dev/null | grep -q "[x]ray run"; then
-    echo -e "${GREEN}✅ 检测到 Xray 进程正在运行${NC}"
-    ps aux 2>/dev/null | grep "[x]ray" || ps | grep "[x]ray"
-    XRAY_RUNNING=1
-else
-    echo -e "${RED}❌ 未检测到 Xray 进程${NC}"
-    echo "Alpine 尝试: rc-service local restart"
-    echo "Debian 尝试: systemctl start xray.service"
-fi
-echo ""
-
-# 2. 检查端口监听
-echo "=========================================="
-echo "2️⃣  检查端口是否监听"
-echo "=========================================="
-if ss -tlnp 2>/dev/null | grep -q ":$XRAY_PORT "; then
-    echo -e "${GREEN}✅ 端口 $XRAY_PORT 正在监听${NC}"
-    ss -tlnp 2>/dev/null | grep ":$XRAY_PORT"
-else
-    echo -e "${RED}❌ 端口 $XRAY_PORT 未监听${NC}"
-    echo "可能原因:"
-    echo "  1. Xray 进程未启动或崩溃"
-    echo "  2. 配置文件错误"
-    echo "  3. 端口被其他进程占用"
-    echo ""
-    echo "尝试这些命令:"
-    echo "  systemctl restart xray.service"
-    echo "  journalctl -u xray.service -n 50"
-fi
-echo ""
-
-# 3. 检查防火墙
-echo "=========================================="
-echo "3️⃣  检查防火墙规则"
-echo "=========================================="
-if command -v ufw >/dev/null 2>&1; then
-    UFW_STATUS=$(ufw status 2>/dev/null | grep "Status:")
-    echo "ufw 状态: $UFW_STATUS"
-    
-    if ufw status | grep -q "inactive"; then
-        echo -e "${YELLOW}⚠️  ufw 已禁用${NC}"
+elif command -v rc-service >/dev/null 2>&1; then
+    if pgrep -f "xray run" >/dev/null 2>&1 || ps 2>/dev/null | grep -q "[x]ray run"; then
+        ok "检测到 xray 进程（OpenRC/local.d）"
     else
-        if ufw status | grep -q "$XRAY_PORT"; then
-            echo -e "${GREEN}✅ 端口 $XRAY_PORT 已在 ufw 白名单${NC}"
-        else
-            echo -e "${RED}❌ 端口 $XRAY_PORT 未在 ufw 白名单${NC}"
-            echo "修复命令: sudo ufw allow $XRAY_PORT/tcp"
+        bad "未检测到 xray 进程"
+        echo "尝试: rc-service local restart"
+    fi
+else
+    if pgrep -f "xray" >/dev/null 2>&1 || ps 2>/dev/null | grep -q "[x]ray"; then
+        ok "检测到 xray 相关进程"
+    else
+        bad "未检测到 xray 进程 —— 客户端会显示 -1ms"
+    fi
+fi
+echo ""
+
+# 2. 端口监听（-1ms 最关键）
+echo "=========================================="
+echo "2️⃣  端口监听检查（-1ms 高发点）"
+echo "=========================================="
+LISTEN_INFO=""
+if command -v ss >/dev/null 2>&1; then
+    LISTEN_INFO=$(ss -tlnp 2>/dev/null | grep -E ":${XRAY_PORT}\\b" || true)
+elif command -v netstat >/dev/null 2>&1; then
+    LISTEN_INFO=$(netstat -tlnp 2>/dev/null | grep -E ":${XRAY_PORT}\\b" || true)
+fi
+
+if [ -n "$LISTEN_INFO" ]; then
+    ok "端口 $XRAY_PORT 正在监听"
+    echo "$LISTEN_INFO"
+    if echo "$LISTEN_INFO" | grep -q '127.0.0.1'; then
+        if ! echo "$LISTEN_INFO" | grep -Eq '0\.0\.0\.0|\*'; then
+            bad "似乎只监听 127.0.0.1 —— 外网必然 -1ms。请把 listen 改为 0.0.0.0"
         fi
     fi
 else
-    echo "⚠️  ufw 未安装"
+    bad "端口 $XRAY_PORT 未监听 —— 客户端延迟几乎一定是 -1ms"
+fi
+echo ""
+
+# 3. 本机回环连通
+echo "=========================================="
+echo "3️⃣  本机 TCP 连通"
+echo "=========================================="
+LOCAL_OK=0
+if command -v nc >/dev/null 2>&1; then
+    if nc -z -w 3 127.0.0.1 "$XRAY_PORT" 2>/dev/null; then
+        ok "127.0.0.1:$XRAY_PORT TCP 可连接"
+        LOCAL_OK=1
+    fi
+fi
+if [ "$LOCAL_OK" -eq 0 ] && command -v timeout >/dev/null 2>&1; then
+    if timeout 3 bash -c "echo >/dev/tcp/127.0.0.1/$XRAY_PORT" 2>/dev/null; then
+        ok "127.0.0.1:$XRAY_PORT TCP 可连接"
+        LOCAL_OK=1
+    fi
+fi
+if [ "$LOCAL_OK" -eq 0 ]; then
+    warn "本机 TCP 探测失败（REALITY 可能不回普通探测，结合监听结果判断）"
+fi
+echo ""
+
+# 4. 防火墙
+echo "=========================================="
+echo "4️⃣  本机防火墙"
+echo "=========================================="
+if command -v ufw >/dev/null 2>&1; then
+    UFW_STATUS=$(ufw status 2>/dev/null || true)
+    echo "$UFW_STATUS" | head -n 5
+    if echo "$UFW_STATUS" | grep -qi "Status: active"; then
+        if echo "$UFW_STATUS" | grep -q "$XRAY_PORT"; then
+            ok "ufw 已放行 $XRAY_PORT"
+        else
+            bad "ufw 已启用但未见 $XRAY_PORT —— 外网会 -1ms"
+            echo "修复: sudo ufw allow ${XRAY_PORT}/tcp && sudo ufw reload"
+        fi
+    else
+        ok "ufw 未启用（或 inactive）"
+    fi
+fi
+
+if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -qi running; then
+    if firewall-cmd --list-ports 2>/dev/null | grep -q "$XRAY_PORT"; then
+        ok "firewalld 已放行 $XRAY_PORT"
+    else
+        bad "firewalld 运行中但可能未放行 $XRAY_PORT"
+        echo "修复: firewall-cmd --permanent --add-port=${XRAY_PORT}/tcp && firewall-cmd --reload"
+    fi
 fi
 
 if command -v iptables >/dev/null 2>&1; then
-    echo ""
-    echo "iptables 规则 (INPUT 链):"
-    iptables -L INPUT -n 2>/dev/null | grep -E "(ACCEPT|DROP|REJECT)" | head -10
+    echo "iptables INPUT 摘要:"
+    iptables -L INPUT -n 2>/dev/null | head -n 12 || true
+    if iptables -C INPUT -p tcp --dport "$XRAY_PORT" -j ACCEPT 2>/dev/null; then
+        ok "iptables 存在 ${XRAY_PORT}/tcp ACCEPT"
+    else
+        warn "未找到显式 iptables ACCEPT（若默认策略不是 DROP 可能仍可用）"
+    fi
+fi
+echo ""
+warn "容器内防火墙通过 ≠ 外网可达。还必须查：云安全组 + 宿主机端口映射/NAT"
+echo ""
+
+# 5. 公网 IP 与地址填写提示
+echo "=========================================="
+echo "5️⃣  公网 IP / 地址填写"
+echo "=========================================="
+PUB_IP=""
+for url in "https://api.ipify.org" "https://ifconfig.me/ip" "https://ipv4.icanhazip.com"; do
+    PUB_IP=$(curl -4 -fsS --connect-timeout 4 --max-time 6 "$url" 2>/dev/null | tr -d '\r\n' || true)
+    echo "$PUB_IP" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && break
+    PUB_IP=""
+done
+LOCAL_IPS=$(ip -4 addr 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | grep -v '^127\.' || true)
+echo "检测到的公网 IP: ${PUB_IP:-获取失败}"
+echo "容器/主机内网 IP:"
+echo "${LOCAL_IPS:-无}"
+if [ -n "$PUB_IP" ]; then
+    ok "可用公网 IP 参考: $PUB_IP"
+    echo "客户端 Address 应填公网 IP（或域名），不要填 10.x / 100.x / 172.16-31.x 内网地址"
+else
+    warn "无法获取公网 IP（NAT 常见）。客户端请填【宿主机公网 IP】"
+fi
+if [ -f "$SHARE_FILE" ]; then
+    echo "分享参数文件: $SHARE_FILE"
+    head -n 20 "$SHARE_FILE" 2>/dev/null || true
 fi
 echo ""
 
-# 4. 检查 MTU
+# 6. MTU
 echo "=========================================="
-echo "4️⃣  检查 MTU 设置"
+echo "6️⃣  MTU"
 echo "=========================================="
-DEFAULT_DEV=$(ip route | grep default | awk '{print $5}' | head -1)
+DEFAULT_DEV=$(ip route 2>/dev/null | grep default | awk '{print $5}' | head -1)
 if [ -n "$DEFAULT_DEV" ]; then
-    MTU=$(ip link show "$DEFAULT_DEV" | sed -n 's/.*mtu \([0-9][0-9]*\).*/\1/p')
-    echo "网卡: $DEFAULT_DEV"
-    echo "MTU: $MTU"
-    if [ "$MTU" != "1500" ] && [ "$MTU" != "1380" ]; then
-        echo -e "${YELLOW}⚠️  MTU 值异常，建议设置为 1380${NC}"
-        echo "修复命令: sudo ip link set dev $DEFAULT_DEV mtu 1380"
+    MTU=$(ip link show "$DEFAULT_DEV" 2>/dev/null | sed -n 's/.*mtu \([0-9][0-9]*\).*/\1/p')
+    echo "网卡: $DEFAULT_DEV  MTU: ${MTU:-未知}"
+    if [ "$MTU" = "1380" ] || [ "$MTU" = "1500" ] || [ "$MTU" = "1450" ] || [ "$MTU" = "1400" ]; then
+        ok "MTU 看起来合理"
     else
-        echo -e "${GREEN}✅ MTU 设置正常${NC}"
+        warn "MTU 值异常，可尝试: ip link set dev $DEFAULT_DEV mtu 1380"
     fi
 else
-    echo -e "${YELLOW}⚠️  无法检测网卡${NC}"
+    warn "无法检测默认网卡"
 fi
 echo ""
 
-# 5. 测试 SNI 连接
+# 7. SNI / dest 可达
 echo "=========================================="
-echo "5️⃣  测试 SNI 连接"
+echo "7️⃣  伪装目标 SNI/dest 可达性"
 echo "=========================================="
-echo "测试连接到 $SNI:443..."
-if timeout 5 curl -s -w "HTTP 状态码: %{http_code}\n延迟: %{time_connect}s\n" -o /dev/null \
-    -I "https://$SNI" 2>/dev/null; then
-    echo -e "${GREEN}✅ SNI 连接正常${NC}"
+echo "测试 https://$SNI ..."
+if curl -fsSI --connect-timeout 5 --max-time 8 "https://$SNI" >/dev/null 2>&1; then
+    ok "SNI 站点可达"
 else
-    echo -e "${RED}❌ SNI 连接失败${NC}"
-    echo "可能原因:"
-    echo "  1. DNS 解析失败"
-    echo "  2. 网络无法访问 $SNI"
-    echo "  3. ISP 或防火墙阻止"
-    echo ""
-    echo "尝试这些命令排查:"
-    echo "  nslookup $SNI"
-    echo "  ping $SNI"
-    echo "  traceroute $SNI"
+    bad "SNI 站点不可达 —— REALITY 握手容易失败（客户端也可能一直失败）"
+    echo "可换 microsoft/apple/ikea 等可达域名，并同步改 dest 与 serverNames"
 fi
 echo ""
 
-# 6. 测试本地端口
+# 8. 配置完整性
 echo "=========================================="
-echo "6️⃣  测试本地 Xray 端口"
+echo "8️⃣  配置完整性"
 echo "=========================================="
-if timeout 3 nc -zv 127.0.0.1 "$XRAY_PORT" 2>&1 | grep -q "succeeded"; then
-    echo -e "${GREEN}✅ 本地端口 127.0.0.1:$XRAY_PORT 可访问${NC}"
+if command -v jq >/dev/null 2>&1; then
+    if jq empty "$XRAY_CONFIG" 2>/dev/null; then
+        ok "JSON 格式正确"
+    else
+        bad "JSON 格式错误"
+        jq empty "$XRAY_CONFIG" 2>&1 | head -5
+    fi
+    echo "realitySettings:"
+    jq '.inbounds[0].streamSettings.realitySettings' "$XRAY_CONFIG" 2>/dev/null || true
 else
-    echo -e "${YELLOW}⚠️  本地端口无法连接（这在 REALITY 协议中可能正常）${NC}"
+    warn "未安装 jq，跳过深度 JSON 检查"
 fi
-echo ""
 
-# 7. 检查配置文件格式
-echo "=========================================="
-echo "7️⃣  检查配置文件格式"
-echo "=========================================="
-if jq empty "$XRAY_CONFIG" 2>/dev/null; then
-    echo -e "${GREEN}✅ 配置文件 JSON 格式正确${NC}"
+if [ -z "$PRIV_KEY" ]; then
+    bad "未读到 privateKey"
 else
-    echo -e "${RED}❌ 配置文件 JSON 格式错误${NC}"
-    jq empty "$XRAY_CONFIG" 2>&1 | head -5
+    LEN=$(printf %s "$PRIV_KEY" | wc -c | tr -d ' ')
+    if [ "$LEN" -ge 40 ] && [ "$LEN" -le 64 ]; then
+        ok "privateKey 长度正常 ($LEN)"
+    else
+        bad "privateKey 长度异常 ($LEN) —— 密钥解析可能错了"
+    fi
+fi
+
+if [ -z "$UUID" ]; then
+    bad "未读到 UUID"
+else
+    ok "UUID 存在"
+fi
+
+if [ "$FLOW" = "xtls-rprx-vision" ]; then
+    ok "flow = xtls-rprx-vision"
+else
+    warn "flow 不是 xtls-rprx-vision（当前: ${FLOW:-空}）"
+fi
+
+if [ -z "$SHORT_ID" ]; then
+    warn "未读到 shortId（若服务端 shortIds 含空字符串，客户端 sid 可留空）"
+else
+    ok "ShortId: $SHORT_ID"
 fi
 echo ""
 
-# 8. 显示配置摘要
+# 9. 时间与日志
 echo "=========================================="
-echo "8️⃣  配置文件摘要"
-echo "=========================================="
-echo "端口: $XRAY_PORT"
-echo "SNI: $SNI"
-echo "协议: vless"
-echo "流: xtls-rprx-vision"
-echo "安全: reality"
-echo ""
-echo "完整配置:"
-cat "$XRAY_CONFIG" | jq '.inbounds[0].streamSettings.realitySettings' 2>/dev/null || echo "无法解析"
-echo ""
-
-# 8.5 检查时间与日志（REALITY 关键）
-echo "=========================================="
-echo "8.5️⃣  检查系统时间与日志"
+echo "9️⃣  时间与日志（REALITY 关键）"
 echo "=========================================="
 echo "当前时间: $(date)"
 if command -v timedatectl >/dev/null 2>&1; then
-    timedatectl | head -5
+    timedatectl 2>/dev/null | head -n 6 || true
 fi
+if command -v chronyc >/dev/null 2>&1; then
+    chronyc tracking 2>/dev/null | head -n 8 || true
+fi
+
+# 粗略提醒：如果系统时间年份离谱
+YEAR=$(date +%Y 2>/dev/null || echo 0)
+if [ "$YEAR" -lt 2024 ] || [ "$YEAR" -gt 2100 ]; then
+    bad "系统时间异常（年份 $YEAR）—— Reality 会直接失败"
+else
+    ok "系统时间年份看起来正常"
+fi
+
 if [ -f "$XRAY_LOG" ]; then
+    ok "日志文件存在: $XRAY_LOG"
     echo "最近日志:"
-    tail -n 30 "$XRAY_LOG" 2>/dev/null || true
+    tail -n 40 "$XRAY_LOG" 2>/dev/null || true
 else
-    echo -e "${YELLOW}⚠️  未找到 $XRAY_LOG（可能仍把日志丢到 /dev/null）${NC}"
+    warn "未找到 $XRAY_LOG"
 fi
-if [ -z "$PRIV_KEY" ]; then
-    echo -e "${RED}❌ 配置中未读到 privateKey${NC}"
-else
-    echo -e "${GREEN}✅ privateKey 已存在（长度: $(printf %s "$PRIV_KEY" | wc -c)）${NC}"
-fi
-if [ -z "$SHORT_ID" ]; then
-    echo -e "${YELLOW}⚠️  未读到 shortId${NC}"
-else
-    echo "ShortId: $SHORT_ID"
+
+if command -v journalctl >/dev/null 2>&1; then
+    echo "journalctl -u xray.service 最近记录:"
+    journalctl -u xray.service -n 30 --no-pager 2>/dev/null || true
 fi
 echo ""
 
-# 9. 诊断建议
+# 10. 外网视角提示
 echo "=========================================="
-echo "📝 诊断建议"
+echo "🔟 外网可达性（需在【你的电脑】上测）"
 echo "=========================================="
+echo "下面这些命令请在客户端电脑执行，不要只在 VPS 里测："
+echo "  # Windows PowerShell"
+echo "  Test-NetConnection -ComputerName <公网IP> -Port $XRAY_PORT"
+echo "  # 或"
+echo "  telnet <公网IP> $XRAY_PORT"
+echo "  # Linux/macOS"
+echo "  nc -vz <公网IP> $XRAY_PORT"
+echo "  curl -v telnet://<公网IP>:$XRAY_PORT"
 echo ""
-echo "如果连接超时，按以下顺序排查:"
+echo "若本机监听正常，但你电脑 Test-NetConnection 失败 = 100% 是"
+echo "  云安全组 / 运营商防火墙 / LXC·LXD 端口未映射 问题，"
+echo "  客户端会稳定显示延迟 -1ms。"
 echo ""
-echo "1. 确认端口开放："
-echo "   telnet <服务器IP> $XRAY_PORT"
+
+# 总结
+echo "=========================================="
+echo "📊 诊断汇总"
+echo "=========================================="
+echo "通过: $SCORE_OK   警告: $SCORE_WARN   严重: $SCORE_BAD"
 echo ""
-echo "2. 确认 SNI 可访问："
-echo "   ping $SNI"
-echo "   curl -v https://$SNI"
+echo "延迟 -1ms 最常见根因排序:"
+echo "  1. 云安全组未放行 TCP $XRAY_PORT"
+echo "  2. LXC/LXD NAT 未做端口映射到容器"
+echo "  3. 客户端填了内网 IP，或 PublicKey/UUID/ShortId/SNI 不一致"
+echo "  4. 新版 Xray 把 Password 当 PublicKey；误填 Hash32 会失败"
+echo "  5. 系统时间偏差过大 / dest 站点服务器访问不了"
+echo "  6. xray 未真正监听 0.0.0.0:$XRAY_PORT"
 echo ""
-echo "3. 检查云服务商防火墙 (AWS/Google Cloud/Azure):"
-echo "   - 查看安全组规则"
-echo "   - 确保允许 TCP $XRAY_PORT 入站"
+echo "建议修复命令:"
+echo "  # 看监听"
+echo "  ss -tlnp | grep $XRAY_PORT"
+echo "  # 看日志"
+echo "  tail -n 100 $XRAY_LOG"
+echo "  journalctl -u xray.service -n 80 --no-pager"
+echo "  # Debian LXD 端口映射示例"
+echo "  lxc config device add <实例> xrayproxy proxy listen=tcp:0.0.0.0:$XRAY_PORT connect=tcp:127.0.0.1:$XRAY_PORT"
+echo "  # 重装/刷新（会重新生成密钥，客户端需同步更新）"
+echo "  curl -fsSL https://raw.githubusercontent.com/GaoYanHai/Alpine-3.8-/main/alpine_xray_improved.sh | sh"
+echo "  curl -fsSL https://raw.githubusercontent.com/GaoYanHai/Alpine-3.8-/main/debian_xray_improved.sh | bash"
 echo ""
-echo "4. 检查 ISP/NAT 问题："
-echo "   traceroute <服务器IP>"
-echo "   mtr <服务器IP>"
-echo ""
-echo "5. 查看详细日志："
-echo "   journalctl -u xray.service -f"
-echo "   tail -n 100 /var/log/xray.log"
-echo ""
-echo "6. 核对客户端参数必须完全一致："
-echo "   UUID / PublicKey / ShortId / SNI / Flow=xtls-rprx-vision / Fingerprint=chrome"
-echo ""
-echo "7. 检查服务器时间误差（超过约 90 秒 Reality 会失败）："
-echo "   date"
-echo "   chronyc tracking 2>/dev/null || timedatectl"
-echo ""
+if [ "$SCORE_BAD" -gt 0 ]; then
+    echo -e "${RED}结论: 发现 $SCORE_BAD 个严重问题，优先处理后再测客户端。${NC}"
+    exit 2
+fi
+if [ "$SCORE_WARN" -gt 0 ]; then
+    echo -e "${YELLOW}结论: 服务可能已起来，但仍有 $SCORE_WARN 个警告；若仍 -1ms，重点查安全组与端口映射。${NC}"
+    exit 0
+fi
+echo -e "${GREEN}结论: 本机侧未见明显异常。若客户端仍 -1ms，基本可断定是安全组/NAT 映射/客户端参数问题。${NC}"
 echo "=========================================="
 echo "✅ 诊断完成"
 echo "=========================================="
+

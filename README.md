@@ -6,36 +6,35 @@
 [![Xray](https://img.shields.io/badge/Core-Xray--core-orange)](https://github.com/XTLS/Xray-core)
 [![Security](https://img.shields.io/badge/Security-REALITY-red)](https://github.com/XTLS/Xray-core/releases)
 
-这是一款专为 **Alpine Linux**（LXC 容器）和 **Debian trixie**（LXD 容器）设计的高性能 Xray 安装与优化脚本。针对 **512MB 小内存** 和 **NAT/LXD 网络环境** 进行了深度调优。
+专为 **Alpine Linux（LXC）** 与 **Debian trixie（LXD）** 设计的 Xray Reality 安装/优化脚本。针对 **512MB 小内存**、**NAT/容器网络** 场景做了容错与排障增强。
+
+> 协议组合：`VLESS + TCP + REALITY + Vision`
 
 ---
 
-## 🆕 更新说明（2026-07-27）
+## 🆕 更新说明（2026-07-28）
 
-### 修复：端口通但客户端连不上（Debian 重点）
-- 🐛 **Debian**：显式监听 `0.0.0.0`，避免部分 LXD/NAT 环境握手异常
-- 🐛 **Debian**：日志从 `/dev/null` 改为 `/var/log/xray.log`，systemd 输出同步落盘
-- 🐛 **Debian**：放宽 `ProtectSystem=strict` 为 `full`，并允许写日志目录，便于排障
-- 🐛 **Debian**：修复 `systemctl start xray.service` 失败（ExecStartPre 提权、降低容器沙箱、启动前 `xray run -test`）
-- 🐛 **Alpine**：密钥提取改为 BusyBox 兼容的 `sed`，优先识别新版 Xray 的 `Password` 公钥字段
-- 🐛 **Alpine**：补齐 `xray.stop`，重启前先清理旧进程，避免“端口还在但配置未生效”
-- ✨ **Alpine**：安装并启用 `chrony`，降低 REALITY 因时间误差失败的概率
-- 🧰 **诊断脚本**：去掉 `grep -P`，兼容 Alpine/OpenRC，增加时间与日志检查
-- 📚 文档补充“端口通但连不上”根因与自检命令
+### 重点修复：客户端延迟一直是 `-1ms`
 
-### 新增 Debian 版本
-- ✨ 支持 **Debian trixie amd64 (20251224_0350)** LXD 容器平台
-- ✨ 从 OpenRC 迁移到 **systemd** 服务管理
-- ✨ 使用 **apt-get** 包管理器替代 apk
-- ✨ 完整的 systemd 单元文件和网络配置脚本
-- ✨ 保留所有 Alpine 版本的错误处理和可靠性特性
+`-1ms` 在 v2rayN / NekoBox / Shadowrocket 等客户端里，通常 **不是“延迟很差”**，而是 **TCP/REALITY 根本没连上**（超时、拒绝、握手失败）。本次针对该现象做了根因级修复与文档化。
 
-### 版本支持矩阵
+| 根因 | 表现 | 本次处理 |
+|------|------|----------|
+| 云安全组 / 宿主机未放行或未映射端口 | 服务正常，客户端 -1ms | 安装时自动尝试放行；诊断脚本强提醒；README 给出 LXD proxy 示例 |
+| 客户端填了容器内网 IP | 本机正常，外网 -1ms | 多源 IPv4 公网 IP 检测；输出明确“填公网 IP” |
+| 新版 Xray `x25519` 字段变化 | 参数“看起来对”但仍失败 | 兼容 `Password` / `Password (PublicKey)` / `PublicKey`；拒绝把 `Hash32` 当公钥 |
+| ShortId / 手填参数不一致 | 能握手到端口但 Reality 失败 | `shortIds` 同时支持 `""` 与固定值；生成 `vless://` 分享链接 |
+| 系统时间偏差 / dest 不可达 | 间歇或稳定失败 | chrony 时间同步；安装时检查伪装站；诊断增加时间与 dest 检查 |
+| 只监听、无日志、难排障 | “VPS 正常但连不上” | 监听 `0.0.0.0`、写 `/var/log/xray.log`、安装后自检、增强 `xray-diagnostic.sh` |
 
-| 系统 | 脚本文件 | 初始化系统 | 包管理器 | 容器平台 |
-|------|---------|---------|--------|--------|
-| **Alpine Linux** | `alpine_xray_improved.sh` | OpenRC | apk | LXC |
-| **Debian trixie** | `debian_xray_improved.sh` | systemd | apt-get | LXD |
+### 脚本改动清单
+- 🔐 **密钥解析增强**：统一 Reality 公钥提取；校验长度/字符集；私钥=公钥时直接失败
+- 🔥 **防火墙**：自动尝试 `ufw` / `firewalld` / `iptables` 放行 TCP `52300`
+- 🌐 **公网 IP**：`ipify` / `ifconfig.me` / `icanhazip` / `ip.sb` 多源，优先 IPv4
+- 📎 **分享链接**：安装完成写入 `/etc/xray/client-link.txt`，减少手填错误
+- 🧪 **安装后自检**：检查端口是否监听（未监听几乎必现 -1ms）
+- 🧰 **诊断脚本重写**：按 -1ms 排查路径打分（进程/监听/防火墙/公网IP/SNI/时间/日志）
+- 🧾 **配置**：`shortIds: ["", "0123456789abcdef"]` + `sniffing` 开启
 
 ---
 
@@ -43,29 +42,36 @@
 
 | 特性 | 说明 |
 |------|------|
-| 🌍 **容器环境优先** | 自动网卡检测，MTU 失败时优雅降级，支持低权限环境 |
-| 📡 **MTU 智能设置** | LXC/LXD 环境设置 MTU 1380 解决丢包，失败不中断 |
-| 🚀 **BBR 自适应** | 支持则启用，不支持则降级到系统默认算法 |
-| 🛡️ **抗审查** | VLESS + TCP + REALITY + Vision，业界最强伪装方案 |
-| 🍃 **低占用** | 原生 init 管理，无冗余进程，内存占用 < 50MB |
-| 🔒 **动态安全** | 运行时生成 UUID 和密钥，源码泄露不威胁服务器 |
-| 🕒 **自我修复** | 每天 04:00 自动重启，防止小内存 OOM |
-| ⚡ **强化容错** | 下载失败自动重试 3 次，二进制验证，JSON 格式检查 |
-| ✅ **配置验证** | 完整的文件有效性检查，防止启动失败 |
+| 🌍 容器环境优先 | 自动网卡检测，MTU 失败优雅降级 |
+| 📡 MTU 智能设置 | LXC/LXD 尝试 MTU 1380，降低长包丢包 |
+| 🚀 BBR 自适应 | 支持则启用，否则降级默认算法 |
+| 🛡️ 抗审查 | VLESS + TCP + REALITY + Vision |
+| 🍃 低占用 | 原生 init，无冗余进程 |
+| 🔒 动态凭证 | 运行时生成 UUID / x25519，避免写死密钥 |
+| 🕒 自我修复 | 每天 04:00 自动重启，缓解小内存 OOM |
+| ⚡ 下载重试 | Xray 二进制下载失败自动重试 3 次 |
+| ✅ 配置验证 | JSON / `xray run -test` / 关键字段校验 |
+
+### 版本支持矩阵
+
+| 系统 | 脚本 | Init | 包管理 | 场景 |
+|------|------|------|--------|------|
+| Alpine Linux | `alpine_xray_improved.sh` | OpenRC | apk | LXC |
+| Debian trixie | `debian_xray_improved.sh` | systemd | apt | LXD |
 
 ---
 
 ## 🛠️ 快速安装
 
-### Alpine LXC 版本（推荐原 Alpine 用户）
+> 需要 root。建议先快照，再执行。
 
-#### 方式一：一键安装
+### Alpine LXC
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/GaoYanHai/Alpine-3.8-/main/alpine_xray_improved.sh | sh
 ```
 
-#### 方式二：本地执行
+或本地执行：
 
 ```bash
 wget -O alpine_xray_improved.sh https://raw.githubusercontent.com/GaoYanHai/Alpine-3.8-/main/alpine_xray_improved.sh
@@ -73,17 +79,13 @@ chmod +x alpine_xray_improved.sh
 sudo sh alpine_xray_improved.sh
 ```
 
----
-
-### Debian LXD 版本（新增！）
-
-#### 方式一：一键安装
+### Debian LXD
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/GaoYanHai/Alpine-3.8-/main/debian_xray_improved.sh | bash
 ```
 
-#### 方式二：本地执行
+或本地执行：
 
 ```bash
 wget -O debian_xray_improved.sh https://raw.githubusercontent.com/GaoYanHai/Alpine-3.8-/main/debian_xray_improved.sh
@@ -91,428 +93,275 @@ chmod +x debian_xray_improved.sh
 sudo bash debian_xray_improved.sh
 ```
 
----
+### 诊断（连不上 / 延迟 -1ms 时先跑）
 
-## 📋 配置指南
-
-### 客户端连接参数
-
-脚本运行完成后，终端会输出您的专属连接信息。请按以下参数配置客户端（支持 v2rayN、Clash Meta、Shadowrocket 等）：
-
-| 配置项 | 参数值 | 说明 |
-|--------|--------|------|
-| **协议** | VLESS | 轻量级协议 |
-| **地址** | `脚本输出的 IP` | 服务器公网 IP |
-| **端口** | 52300 | 默认监听端口 |
-| **UUID** | `脚本输出的 UUID` | 用户身份识别 |
-| **流控** | xtls-rprx-vision | 完整性校验算法 |
-| **加密** | none | VLESS 不需加密 |
-| **传输安全** | reality | 伪装为 TLS 流量 |
-| **SNI** | www.ikea.com | 伪装目标域名 |
-| **Fingerprint** | chrome | 客户端指纹 |
-| **PublicKey** | `脚本输出的 PublicKey` | Reality 公钥 |
-| **ShortId** | 0123456789abcdef | 短连接 ID |
-
-### ⚠️ 重要提示
-
-- **公钥位置**：请使用脚本输出的 **PublicKey** 字段，NOT ~~Password~~
-- **时间同步**：Reality 协议对时间精度要求极高（误差 ≤ 90 秒），部署前请检查系统时间
-- **端口开放**：确保防火墙允许 TCP 52300 入站
+```bash
+wget -O xray-diagnostic.sh https://raw.githubusercontent.com/GaoYanHai/Alpine-3.8-/main/xray-diagnostic.sh
+chmod +x xray-diagnostic.sh
+sudo sh xray-diagnostic.sh
+```
 
 ---
 
-## ⚙️ 服务管理
+## 📋 客户端配置指南
 
-### Alpine LXC 版本（OpenRC）
+安装结束后终端会输出参数，并保存到：
 
-```bash
-# 重启服务（重新读取配置）
-rc-service local restart
+- `/etc/xray/client-link.txt`
+- 配置文件：`/etc/xray/config.json`
 
-# 停止服务
-rc-service local stop
+**推荐直接导入分享链接**，少手填。
 
-# 查看运行状态
-ps aux | grep xray
+| 配置项 | 值 | 说明 |
+|--------|----|------|
+| 协议 | VLESS | |
+| 地址 | 脚本输出的**公网 IP** | 不要填容器内网 IP |
+| 端口 | `52300` | 默认 |
+| UUID | 脚本输出 | |
+| 流控 Flow | `xtls-rprx-vision` | 必填 |
+| 加密 | `none` | VLESS |
+| 传输 | `tcp` | |
+| 安全 | `reality` | |
+| SNI | 脚本输出（如 `www.ikea.com`） | 必须与服务端 `serverNames` 一致 |
+| Fingerprint | `chrome` | |
+| PublicKey | 脚本输出的公钥 | **新版 Xray 来自 `Password` 字段** |
+| ShortId | `0123456789abcdef`（或空） | 与服务端 `shortIds` 之一匹配 |
 
-# 查看实时日志（仅调试使用）
-/usr/local/bin/xray run -c /etc/xray/config.json
+### ⚠️ 关于 PublicKey / Password / Hash32（极易填错）
 
-# 查看内存占用
-free -m
+新版 Xray `xray x25519` 常见输出：
+
+```text
+PrivateKey: <服务器私钥，只放服务端 config>
+Password:   <客户端 PublicKey / pbk>
+Hash32:     <不是客户端公钥，不要填>
 ```
 
-### Debian LXD 版本（systemd）
-
-```bash
-# 查看服务状态
-systemctl status xray.service
-
-# 重启服务（重新读取配置）
-systemctl restart xray.service
-
-# 停止服务
-systemctl stop xray.service
-
-# 启动服务
-systemctl start xray.service
-
-# 查看日志（最后 50 行）
-journalctl -u xray.service -n 50
-
-# 实时查看日志
-journalctl -u xray.service -f
-
-# 查看内存占用
-free -m
-```
-
-### 配置文件位置
-
-#### Alpine 版本
-
-| 文件 | 用途 |
+| 字段 | 用途 |
 |------|------|
-| `/etc/xray/config.json` | Xray 主配置文件 |
-| `/etc/local.d/xray.start` | 开机启动脚本 |
-| `/var/spool/cron/crontabs/root` | 定时重启任务 |
+| PrivateKey | 仅服务端 `realitySettings.privateKey` |
+| Password | **就是客户端 PublicKey（pbk）** |
+| PublicKey（旧版字段名） | 同客户端公钥 |
+| Hash32 | **不要填进客户端** |
 
-#### Debian 版本
-
-| 文件 | 用途 |
-|------|------|
-| `/etc/xray/config.json` | Xray 主配置文件 |
-| `/etc/systemd/system/xray.service` | systemd 服务单元 |
-| `/usr/local/bin/setup-xray-network.sh` | 网络配置脚本 |
-| Crontab | 定时重启任务（由 crontab 管理） |
+脚本已自动把 `Password` 映射并打印为 `PublicKey`，按终端输出填写即可。
 
 ---
 
-## 🔧 故障排查
+## 🚨 延迟一直是 -1ms：完整排查手册
 
-### "三板斧"快速自救
+### 先理解现象
 
-#### 第一步：强制拉起服务
+| 客户端显示 | 真实含义 |
+|------------|----------|
+| 延迟 `-1ms` / 超时 | 到不了端口，或 TCP 通了但 Reality 握手失败 |
+| 延迟正常但网页失败 | 出站/路由/DNS 问题（少见，先排除连通） |
 
-**Alpine 版本：**
+### 排查顺序（按命中率）
+
+#### 1) 云安全组 / 面板防火墙（最高发）
+
+确保 **TCP 52300 入站** 对你的客户端 IP 或 `0.0.0.0/0` 放行。  
+仅容器内 `ss` 显示监听 **不等于** 公网可达。
+
+#### 2) LXC / LXD 端口映射
+
+容器若在 NAT 后面，必须在**宿主机**做转发/代理。
+
+**LXD 示例：**
+
 ```bash
-sh /etc/local.d/xray.start
-sleep 2
-ps aux | grep xray
+lxc config device add <实例名> xrayproxy proxy \
+  listen=tcp:0.0.0.0:52300 \
+  connect=tcp:127.0.0.1:52300
 ```
 
-**Debian 版本：**
-```bash
-systemctl restart xray.service
-sleep 2
-systemctl status xray.service
-```
-
-#### 第二步：检查内存
+**LXC/iptables 示例（宿主机）：**
 
 ```bash
-free -m
-# 如果内存不足，考虑开启 Swap：
-dd if=/dev/zero of=/swapfile bs=1M count=512
-mkswap /swapfile
-swapon /swapfile
+# 视实际网卡与容器 IP 调整
+iptables -t nat -A PREROUTING -p tcp --dport 52300 -j DNAT --to-destination <容器IP>:52300
+iptables -A FORWARD -p tcp -d <容器IP> --dport 52300 -j ACCEPT
 ```
 
-#### 第三步：验证时间
+#### 3) 客户端地址是否填错
+
+- ✅ 宿主机/VPS **公网 IPv4**
+- ❌ `10.x` / `100.x` / `172.16-31.x` 等容器网桥地址
+- ❌ 仅内网可达的 `tailscale`/`zerotier` IP（除非客户端也在同网）
+
+本机验证：
+
+```bash
+ss -tlnp | grep 52300
+cat /etc/xray/client-link.txt
+```
+
+你的电脑上验证（关键）：
+
+```powershell
+# Windows
+Test-NetConnection -ComputerName <公网IP> -Port 52300
+```
+
+```bash
+# Linux / macOS
+nc -vz <公网IP> 52300
+```
+
+> 服务器监听正常，但你电脑端口不通 → **几乎可以断定是安全组或端口映射问题**，客户端会稳定 `-1ms`。
+
+#### 4) 参数一致性
+
+必须逐项一致：
+
+- UUID
+- PublicKey（pbk，来自 Password）
+- ShortId（sid）
+- SNI
+- Flow = `xtls-rprx-vision`
+- Fingerprint = `chrome`
+- Network = `tcp`
+- Security = `reality`
+
+差一个 Reality 都可能失败。优先用 `/etc/xray/client-link.txt` 里的分享链接。
+
+#### 5) 服务是否真的在听 `0.0.0.0`
+
+```bash
+ss -tlnp | grep 52300
+# 期望类似 0.0.0.0:52300 或 *:52300
+# 若只有 127.0.0.1:52300，外网必 -1ms
+```
+
+#### 6) 时间与伪装站
 
 ```bash
 date
-# Alpine: ntpd -q -p pool.ntp.org  # 强制同步时间（若需要）
-# Debian: timedatectl set-ntp true && timedatectl show
+chronyc tracking 2>/dev/null || timedatectl
+curl -I https://<你的SNI>
+tail -n 100 /var/log/xray.log
 ```
 
-### 常见问题
+Reality 对时间敏感；`dest` 站点若服务器访问失败，握手也容易挂。
 
-| 问题 | 原因 | 解决方案 |
-|------|------|--------|
-| **连接失败** | Reality 时间误差 > 90s | 运行 `date` 检查，使用时间同步 |
-| **端口通但连不上** | 公钥/参数不匹配、日志被丢弃、旧进程残留、systemd 过严 | 重跑最新脚本；核对 UUID/PublicKey/ShortId/SNI；查看 `/var/log/xray.log` |
-| **频繁断连** | 内存不足 OOM | 检查 `free -m`，开启 Swap 虚拟内存 |
-| **MTU 设置失败** | 容器网络不支持修改 | **继续使用系统默认值**（脚本已优雅降级） |
-| **BBR 启用失败** | 内核不支持 BBR | **自动降级到系统默认算法**（脚本已处理） |
-| **下载 Xray 失败** | 网络不稳定 | 脚本自动重试 3 次，仍失败可手动下载后再执行 |
-| **配置文件格式错误** | JSON 结构破损 | 运行 `jq empty /etc/xray/config.json` 验证 |
-| **Debian 服务无法启动** | systemd 错误 | 运行 `journalctl -u xray.service -n 20` 查看日志 |
-
-### 高级调试
-
-**Alpine 版本：**
+#### 7) 一键诊断
 
 ```bash
-# 修改日志等级为 debug
-sed -i 's/"loglevel": "none"/"loglevel": "debug"/g' /etc/xray/config.json
+sudo sh xray-diagnostic.sh
+```
 
-# 重启服务
+按脚本输出的 **严重/警告** 项处理即可。
+
+---
+
+## 🔧 日常运维
+
+### Alpine
+
+```bash
+# 重启
 rc-service local restart
-
-# 前台运行查看日志
-/usr/local/bin/xray run -c /etc/xray/config.json
-
-# 恢复日志关闭
-sed -i 's/"loglevel": "debug"/"loglevel": "none"/g' /etc/xray/config.json
+# 日志
+tail -n 100 /var/log/xray.log
+# 进程
+ps | grep xray
 ```
 
-**Debian 版本：**
+### Debian
 
 ```bash
-# 修改日志等级为 debug
-sed -i 's/"loglevel": "none"/"loglevel": "debug"/g' /etc/xray/config.json
-
-# 重启服务
+systemctl status xray.service
 systemctl restart xray.service
-
-# 查看详细日志
-journalctl -u xray.service -n 100 --no-pager
-
-# 前台运行查看日志（停止服务后）
-systemctl stop xray.service
-/usr/local/bin/xray run -c /etc/xray/config.json
-
-# 恢复日志关闭
-sed -i 's/"loglevel": "debug"/"loglevel": "none"/g' /etc/xray/config.json
-systemctl start xray.service
+journalctl -u xray.service -n 80 --no-pager
+tail -n 100 /var/log/xray.log
 ```
 
+### 更换 SNI
+
+编辑 `/etc/xray/config.json` 中：
+
+```json
+"dest": "www.microsoft.com:443",
+"serverNames": ["www.microsoft.com"]
+```
+
+然后重启服务；**客户端 SNI 必须同步修改**。
+
 ---
 
-## 🔐 安全建议
+## ❓ 常见问题
 
-- ✅ 脚本生成的 UUID 和密钥仅保存于本地配置文件，**不依赖云端**
-- ✅ GitHub 源码泄露 ≠ 服务器被攻击（每次运行生成新密钥）
-- ✅ 定期备份 `/etc/xray/config.json`（包含私钥信息）
-- ⚠️ **不要在公共论坛、GitHub Issues 贴出完整连接参数**
-- ⚠️ **不要在截图中暴露 UUID 和 PublicKey**
+**Q: VPS 上脚本显示安装成功，客户端却一直 -1ms？**  
+A: 先在你自己电脑对公网 IP:`52300` 做 `Test-NetConnection` / `nc`。不通就查安全组与 LXC/LXD 映射，不是客户端“参数玄学”。
+
+**Q: 端口外面都通了，还是连不上？**  
+A: 核对手填 PublicKey（是否误填 Hash32）、UUID、ShortId、SNI、Flow；看 `/var/log/xray.log`；确认时间同步。
+
+**Q: 重跑脚本后旧客户端失效？**  
+A: 正常。脚本会重新生成 UUID/密钥，需用新的 `/etc/xray/client-link.txt`。
+
+**Q: 为什么 ShortId 固定为 `0123456789abcdef`？**  
+A: 便于排障与文档化；服务端同时允许空 ShortId。若要更安全，可自行改为随机 16 进制并同步客户端。
+
+**Q: MTU / BBR 设置失败？**  
+A: 容器权限常见限制，脚本会降级继续；一般不导致 -1ms。
 
 ---
 
-## 📊 性能指标（参考）
+## 📁 文件说明
 
-| 指标 | 数值 |
+| 文件 | 说明 |
 |------|------|
-| **内存占用** | 40-60 MB（Xray 进程） |
-| **CPU 占用** | < 5% （低流量场景） |
-| **启动时间** | 2-5 秒 |
-| **数据包延迟** | +0ms（无额外开销） |
-| **吞吐量** | 受限于网络带宽 |
+| `alpine_xray_improved.sh` | Alpine/OpenRC 一键安装 |
+| `debian_xray_improved.sh` | Debian/systemd 一键安装 |
+| `xray-diagnostic.sh` | 连通性/ -1ms 诊断 |
+| `README.md` | 本文档 |
 
----
+安装后关键路径：
 
-## 📝 系统要求
-
-### Alpine LXC 版本
-
-| 要求 | 说明 |
+| 路径 | 说明 |
 |------|------|
-| **操作系统** | Alpine Linux 3.8+ |
-| **内存** | ≥ 512 MB（推荐 1 GB） |
-| **磁盘** | ≥ 1 GB 空闲空间 |
-| **网络** | NAT 或直连网络均支持 |
-| **权限** | 需要 root 权限执行 |
-
-### Debian LXD 版本
-
-| 要求 | 说明 |
-|------|------|
-| **操作系统** | Debian trixie amd64 (20251224_0350) 或更新版本 |
-| **内存** | ≥ 512 MB（推荐 1 GB） |
-| **磁盘** | ≥ 1 GB 空闲空间 |
-| **网络** | NAT/LXD 或直连网络均支持 |
-| **权限** | 需要 root 权限执行 |
-| **依赖** | curl, ca-certificates, unzip, jq |
+| `/etc/xray/config.json` | Xray 配置 |
+| `/etc/xray/client-link.txt` | 客户端参数与分享链接 |
+| `/var/log/xray.log` | 业务日志 |
+| `/usr/local/bin/xray` | 核心二进制 |
 
 ---
 
-## 🌍 LXC/LXD 环境兼容性说明
+## 🔒 安全提示
 
-本脚本针对容器网络环境进行了完整优化：
-
-### 网卡自动检测
-```bash
-# 自动识别网卡（不依赖 eth0）
-NETIF=$(ip route | grep default | awk '{print $5}' | head -1)
-```
-
-### MTU 智能设置
-- 尝试设置 MTU 1380（LXC/LXD 环境推荐值）
-- 失败时**优雅降级**，继续使用系统默认值
-- 不会因为权限不足而中断执行
-
-### BBR 自动降级
-- 尝试启用 BBR 拥塞控制
-- 不支持时自动降级到系统默认算法
-- 脚本继续正常执行
-
-### 低权限环境支持
-- 即使无法修改 BBR、MTU，脚本仍能完整运行
-- 所有网络优化均为可选，不影响核心功能
+- 不要在公共 issue/截图里贴 UUID、PublicKey、完整分享链接
+- 尽量限制安全组来源 IP
+- 定期 `tail` 日志，确认无异常扫描占用
+- 小内存机器保留每日重启策略，或自行加 swap
 
 ---
 
-## 🚀 高级优化建议
+## 📜 更新日志
 
-### 1. 验证 BBR 是否启用
-```bash
-sysctl net.ipv4.tcp_congestion_control
-# 如果输出为 bbr，说明启用成功
-# 如果输出为其他值（如 cubic），说明环境不支持，继续使用默认值即可
-```
+### v3.2（2026-07-28）— 针对延迟 -1ms
+- 修复/增强 x25519 公钥解析（Password / PublicKey / 防 Hash32）
+- 安装时尝试开放防火墙端口
+- 多源 IPv4 公网 IP 检测
+- 生成 vless 分享链接到 `/etc/xray/client-link.txt`
+- shortIds 兼容空值；开启 sniffing
+- 安装后监听自检；诊断脚本按 -1ms 路径重写
+- README 补充安全组 / NAT 映射 / 客户端自测步骤
 
-### 2. 自定义 MTU 值
+### v3.1（2026-07-27）— 端口通但连不上
+- Debian 显式 `0.0.0.0` 监听、日志落盘、systemd 启动修复
+- Alpine 密钥提取 BusyBox 兼容、补 `xray.stop`、启用 chrony
+- 诊断脚本去 `grep -P`
 
-**Alpine 版本：**
-```bash
-vi /etc/local.d/xray.start
-# 修改 mtu 1380 为目标值（如 1400, 1500 等）
-rc-service local restart
-```
+### v3.0 — Debian LXD 支持
+- systemd / apt / 自动 SNI 检测
 
-**Debian 版本：**
-```bash
-vi /usr/local/bin/setup-xray-network.sh
-# 修改 mtu 1380 为目标值（如 1400, 1500 等）
-systemctl restart xray.service
-```
-
-### 3. 监控服务健康度
-
-**Alpine 版本：**
-```bash
-cat > /usr/local/bin/monitor.sh << 'EOF'
-#!/bin/sh
-while true; do
-    if ! pgrep xray > /dev/null; then
-        echo "Xray 已离线，自动重启..." | logger
-        rc-service local restart
-    fi
-    sleep 300  # 每 5 分钟检查一次
-done
-EOF
-
-chmod +x /usr/local/bin/monitor.sh
-```
-
-**Debian 版本：**
-```bash
-cat > /usr/local/bin/monitor.sh << 'EOF'
-#!/bin/bash
-while true; do
-    if ! systemctl is-active --quiet xray.service; then
-        echo "Xray 已离线，自动重启..." | logger
-        systemctl restart xray.service
-    fi
-    sleep 300  # 每 5 分钟检查一次
-done
-EOF
-
-chmod +x /usr/local/bin/monitor.sh
-```
+### v2.x — NAT 兼容与稳定性
+- MTU/BBR 降级、网卡自检、重试下载、文档完善
 
 ---
 
-## 📚 相关资源
+## 📄 License
 
-- 🔗 [Xray-core 官方仓库](https://github.com/XTLS/Xray-core)
-- 🔗 [REALITY 协议详解](https://github.com/XTLS/Xray-core/discussions/1713)
-- 🔗 [Alpine Linux 官网](https://alpinelinux.org/)
-- 🔗 [OpenRC 服务管理](https://wiki.alpinelinux.org/wiki/OpenRC)
-- 🔗 [Debian 官网](https://www.debian.org/)
-- 🔗 [systemd 官方文档](https://systemd.io/)
-
----
-
-## 📄 更新日志
-
-### v3.1（连通性修复版）- 2026-07-27
-- 🐛 **重点修复 Debian**：`listen 0.0.0.0` + 文件日志 + systemd 权限放宽
-- 🐛 **修复 Debian 启动失败**：`ExecStartPre=+...`、去除过严沙箱、启动前配置测试并打印 journal
-- 🐛 **修复 Alpine**：BusyBox 安全密钥提取、`xray.stop`、进程残留、chrony 时间同步
-- 🧰 **增强诊断**：兼容 OpenRC/systemd，检查时间、日志、privateKey/shortId
-- 📚 **文档**：把“端口通但连不上”说明写入更新说明与更新日志
-- 🎯 针对现象：端口可达、cron/服务正常，但 Reality 客户端无法连通
-
-### v3.0（Debian LXD 支持版）- 2026-06-10
-- ✨ **新增 Debian trixie 支持**
-- ✨ 从 OpenRC 迁移到 systemd
-- ✨ 创建独立的 Debian 脚本版本
-- ✨ 新增 systemd 服务单元文件
-- ✨ 完整的网络配置脚本
-- ✨ 改进 cron 任务管理
-- 📚 更新文档支持多系统
-
-### v2.1（NAT 兼容增强版）- 2026-06-10
-- ✨ **核心改进**：NAT 环境自动兼容
-- ✨ 网卡自动检测，支持非 eth0 网卡
-- ✨ MTU/BBR 失败时优雅降级（不中断执行）
-- ✨ 增强下载可靠性（3 次重试机制）
-- ✨ 文件有效性完整验证
-- ✨ 二进制兼容性检查
-- ✨ 服务启动验证反馈
-- 🐛 修复权限不足导致脚本失败的问题
-- 📈 提升低权限环境的可用性
-- 📚 完整重写 NAT 环境指南
-
-### v2.0（改进版）- 2026-06-10
-- ✨ 新增错误处理与验证机制
-- ✨ 实现下载重试机制（3 次失败重试）
-- ✨ 添加 JSON 格式校验
-- ✨ 完善 Cron 去重检查
-- ✨ 支持 `ip` 命令备选（兼容性更好）
-- 🐛 修复密钥提取错误（PublicKey 字段识别）
-- 📈 优化临时文件管理（自动清理）
-- 📚 完整重写文档
-
-### v1.0（原始版本）- 2025-12-26
-- 🎉 首次发布（Alpine LXC 版本）
-
----
-
-## 📧 反馈与支持
-
-如遇问题，请通过以下方式反馈：
-
-- 📌 [GitHub Issues](https://github.com/GaoYanHai/Alpine-3.8-/issues)
-- 💬 [讨论区](https://github.com/GaoYanHai/Alpine-3.8-/discussions)
-
----
-
-## 📜 开源协议
-
-本项目基于 **MIT License** 许可发行。详见 [LICENSE](https://opensource.org/licenses/MIT)
-
-```
-MIT License
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-```
-
----
-
-## 🙏 致谢
-
-- [XTLS Team](https://github.com/XTLS) - Xray-core 开发
-- [Alpine Linux 社区](https://alpinelinux.org/) - 轻量级 Linux 发行版
-- [Debian 社区](https://www.debian.org/) - 稳定的 Linux 发行版
-- 所有使用者的反馈与支持
-
----
-
-<div align="center">
-
-**⭐ 如果本项目对你有帮助，请给个 Star 支持一下！**
-
-Made with ❤️ by [GaoYanHai](https://github.com/GaoYanHai)
-
-</div>
+MIT
