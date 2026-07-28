@@ -16,6 +16,8 @@ SOCKS_PORT="${SOCKS_PORT:-10808}"
 SOCKS_USER="${SOCKS_USER:-}"
 SOCKS_PASS="${SOCKS_PASS:-}"
 SOCKS_INBOUND_JSON=""
+SOCKS_USER_ESC=""
+SOCKS_PASS_ESC=""
 SOCKS_INFO_TEXT=""
 SHORT_ID="0123456789abcdef"
 DEST_SITE=""
@@ -628,49 +630,30 @@ configure_socks_optional() {
     echo "账号要求: 用户名 1-64（字母数字._@+-）；密码 8-128，须含字母+数字，且不能与用户名相同"
     prompt_socks_credentials
 
-    su_esc=$(json_escape "$SOCKS_USER")
-    sp_esc=$(json_escape "$SOCKS_PASS")
+    su_esc=$(json_escape "$SOCKS_USER") || error_exit "SOCKS user escape failed"
+    sp_esc=$(json_escape "$SOCKS_PASS") || error_exit "SOCKS pass escape failed"
 
-    # 前导逗号：追加到 VLESS inbound 之后
-    SOCKS_INBOUND_JSON=$(printf '%s' ",
-    {
-        \"tag\": \"socks-in\",
-        \"listen\": \"0.0.0.0\",
-        \"port\": ${SOCKS_PORT},
-        \"protocol\": \"socks\",
-        \"settings\": {
-            \"auth\": \"password\",
-            \"accounts\": [{
-                \"user\": \"${su_esc}\",
-                \"pass\": \"${sp_esc}\"
-            }],
-            \"udp\": true
-        },
-        \"sniffing\": {
-            \"enabled\": true,
-            \"destOverride\": [\"http\", \"tls\", \"quic\"]
-        }
-    }")
+    # Do not inject JSON via heredoc; merge with jq after base config is written
+    SOCKS_INBOUND_JSON="1"
+    SOCKS_USER_ESC="$su_esc"
+    SOCKS_PASS_ESC="$sp_esc"
 
-    SOCKS_INFO_TEXT=$(printf '%s
-' \
-        "SOCKS5 已启用:" \
-        "  地址: (同服务器公网 IP)" \
-        "  端口: ${SOCKS_PORT}" \
-        "  用户: ${SOCKS_USER}" \
-        "  密码: ${SOCKS_PASS}" \
-        "  协议: socks5" \
-        "  认证: username/password" \
-        "  UDP:  true")
+    SOCKS_INFO_TEXT=$(printf '%s\n' \
+        "SOCKS5 enabled" \
+        "  port: ${SOCKS_PORT}" \
+        "  user: ${SOCKS_USER}" \
+        "  pass: ${SOCKS_PASS}" \
+        "  auth: username/password" \
+        "  NOTE: open cloud SG / LXD map for TCP ${SOCKS_PORT} separately")
 
-    echo "✅ 将写入 SOCKS5 入站: 0.0.0.0:${SOCKS_PORT} (user=${SOCKS_USER})"
+    echo "SOCKS5 will be added on 0.0.0.0:${SOCKS_PORT} (user=${SOCKS_USER})"
 }
 
 
 # 1. 环境准备与依赖安装
 echo "正在安装基础依赖..."
 run_cmd apk update
-run_cmd apk add curl gcompat ca-certificates unzip openrc iproute2 chrony openssl bind-tools python3
+run_cmd apk add curl gcompat ca-certificates unzip openrc iproute2 chrony openssl bind-tools python3 jq
 
 # 创建必要目录
 run_cmd mkdir -p "$XRAY_DIR" "$(dirname "$XRAY_BIN")" /var/log /etc/local.d
@@ -804,7 +787,7 @@ cat > "$XRAY_CONFIG" << CONF
             "enabled": true,
             "destOverride": ["http", "tls", "quic"]
         }
-    }$SOCKS_INBOUND_JSON],
+    }],
     "outbounds": [{
         "protocol": "freedom",
         "settings": {}
@@ -826,6 +809,43 @@ else
         error_exit "配置文件写入 UUID 失败"
     fi
     echo "⚠️  警告: 未安装 jq，已做基础字段检查 (apk add jq 可加强验证)"
+fi
+
+# Merge SOCKS5 inbound with jq when enabled
+if [ "${ENABLE_SOCKS:-0}" = "1" ]; then
+    if ! command -v jq >/dev/null 2>&1; then
+        error_exit "SOCKS5 requires jq"
+    fi
+    tmp_cfg="${XRAY_CONFIG}.socks.tmp"
+    if ! jq \
+        --argjson port "$SOCKS_PORT" \
+        --arg user "$SOCKS_USER" \
+        --arg pass "$SOCKS_PASS" \
+        '.inbounds += [{
+            tag: "socks-in",
+            listen: "0.0.0.0",
+            port: $port,
+            protocol: "socks",
+            settings: {
+                auth: "password",
+                accounts: [{user: $user, pass: $pass}],
+                udp: true
+            },
+            sniffing: {
+                enabled: true,
+                destOverride: ["http", "tls", "quic"]
+            }
+        }]' \
+        "$XRAY_CONFIG" > "$tmp_cfg"; then
+        rm -f "$tmp_cfg" 2>/dev/null || true
+        error_exit "failed to merge SOCKS5 inbound with jq"
+    fi
+    mv "$tmp_cfg" "$XRAY_CONFIG"
+    if ! jq -e --argjson port "$SOCKS_PORT" '.inbounds[] | select(.protocol=="socks" and .port==$port)' "$XRAY_CONFIG" >/dev/null; then
+        error_exit "SOCKS5 inbound missing after merge"
+    fi
+    echo "SOCKS5 inbound merged (port=$SOCKS_PORT)"
+    jq '.inbounds[] | select(.protocol=="socks") | {tag,listen,port,protocol,auth:.settings.auth,udp:.settings.udp,user:.settings.accounts[0].user}' "$XRAY_CONFIG" 2>/dev/null || true
 fi
 
 # 配置测试
@@ -974,7 +994,48 @@ run_cmd rc-service crond start
 
 # 8. 输出安装结果
 echo ""
-echo "正在获取公网 IP..."
+echo "
+# SOCKS5 local self-check
+if [ "${ENABLE_SOCKS:-0}" = "1" ]; then
+    echo ""
+    echo "Checking SOCKS5 locally..."
+    if command -v ss >/dev/null 2>&1; then
+        if ss -tln 2>/dev/null | grep -Eq ":${SOCKS_PORT}\\b"; then
+            echo "SOCKS port ${SOCKS_PORT} is listening"
+            ss -tlnp 2>/dev/null | grep -E ":${SOCKS_PORT}\\b" || true
+        else
+            echo "SOCKS port ${SOCKS_PORT} NOT listening"
+        fi
+    fi
+    socks_ok=0
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsS --connect-timeout 8 --max-time 15 \
+            --socks5-hostname "127.0.0.1:${SOCKS_PORT}" \
+            -U "${SOCKS_USER}:${SOCKS_PASS}" \
+            "https://api.ipify.org" >/tmp/socks-test.out 2>/tmp/socks-test.err; then
+            echo "SOCKS5 local proxy OK, egress IP: $(cat /tmp/socks-test.out 2>/dev/null)"
+            socks_ok=1
+        elif curl -fsS --connect-timeout 8 --max-time 15 \
+            -x "socks5h://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${SOCKS_PORT}" \
+            "https://api.ipify.org" >/tmp/socks-test.out 2>/tmp/socks-test.err; then
+            echo "SOCKS5 local proxy OK, egress IP: $(cat /tmp/socks-test.out 2>/dev/null)"
+            socks_ok=1
+        fi
+    fi
+    if [ "$socks_ok" -ne 1 ]; then
+        echo "SOCKS5 local proxy test FAILED"
+        tail -n 50 "$XRAY_LOG" 2>/dev/null || true
+        [ -f /tmp/socks-test.err ] && cat /tmp/socks-test.err 2>/dev/null || true
+    fi
+    echo "If local OK but client stays Connecting:"
+    echo "  - open cloud security group TCP ${SOCKS_PORT}"
+    echo "  - map LXD/LXC port ${SOCKS_PORT} separately from Reality port"
+    echo "  - client must use SOCKS5 + username/password (not SOCKS4/noauth)"
+    echo "  lxc config device add <name> socksproxy proxy listen=tcp:0.0.0.0:${SOCKS_PORT} connect=tcp:127.0.0.1:${SOCKS_PORT}"
+    echo "  Test-NetConnection -ComputerName <public-ip> -Port ${SOCKS_PORT}"
+fi
+
+正在获取公网 IP..."
 CLEAR_IP=$(get_public_ip)
 
 # 生成可导入的分享链接，减少手工填错（这是 -1ms 的高发原因）

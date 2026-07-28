@@ -425,6 +425,11 @@ A: 容器权限常见限制，脚本会降级继续；一般不导致 -1ms。
 
 ## 📜 更新日志
 
+### v3.4.4（2026-07-28）— 修复 SOCKS5 一直连接中
+- 改用 jq 合并 SOCKS 入站，避免 heredoc 拼接异常
+- 安装后本机 curl 经 SOCKS5 自检
+- 文档明确：SOCKS 端口需单独安全组/LXD 映射
+
 ### v3.4.3（2026-07-28）— 修复 json_escape 语法错误
 - 修复 `bash: syntax error near unexpected token out="$out\\"`
 - `json_escape` 改为 python3/jq/awk 实现，去掉易碎 case 反斜杠分支
