@@ -377,31 +377,29 @@ assert_sni_usable() {
 # 非交互: ENABLE_SOCKS=1 SOCKS_PORT=10808 SOCKS_USER=xx SOCKS_PASS=yy
 # ------------------------------------------------------------
 json_escape() {
-    # 避免 sed s/// 在 BusyBox/部分 GNU sed 上因反斜杠分隔符解析失败
-    # 优先 python；否则 awk；再否则纯 shell
+    # Robust JSON string escape for SOCKS user/pass.
+    # Prefer python3/jq; never use fragile shell case/sed backslash branches.
     if command -v python3 >/dev/null 2>&1; then
-        printf %s "$1" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read())[1:-1])' 2>/dev/null && return 0
+        SOCKS_JSON_ESC_IN="$1" python3 -c 'import json,os,sys; sys.stdout.write(json.dumps(os.environ.get("SOCKS_JSON_ESC_IN",""))[1:-1])'
+        return $?
     fi
     if command -v python >/dev/null 2>&1; then
-        printf %s "$1" | python -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read())[1:-1])' 2>/dev/null && return 0
+        SOCKS_JSON_ESC_IN="$1" python -c 'import json,os,sys; sys.stdout.write(json.dumps(os.environ.get("SOCKS_JSON_ESC_IN",""))[1:-1])'
+        return $?
     fi
-    if command -v awk >/dev/null 2>&1; then
-        printf %s "$1" | awk 'BEGIN{ORS=""} { gsub(/\/, "\\"); gsub(/"/, "\\""); print }' && return 0
+    if command -v jq >/dev/null 2>&1; then
+        jq -rn --arg s "$1" '$s|tojson' | awk 'BEGIN{ORS=""} {print substr($0,2,length($0)-2)}'
+        return $?
     fi
-    in="$1"
-    out=""
-    while [ -n "$in" ]; do
-        c=$(printf %s "$in" | cut -c1)
-        rest=$(printf %s "$in" | cut -c2-)
-        case "$c" in
-            \) out="$out\\" ;;
-            \") out="$out\\"" ;;
-            *) out="$out$c" ;;
-        esac
-        in="$rest"
-    done
-    printf %s "$out"
+    if printf %s "$1" | grep -Eq '^[A-Za-z0-9._@+-]+$'; then
+        printf %s "$1"
+        return 0
+    fi
+    echo "json_escape: need python3 or jq to escape special chars; install python3" >&2
+    return 1
 }
+
+
 
 
 is_truthy() {
@@ -672,7 +670,7 @@ configure_socks_optional() {
 # 1. 环境准备与依赖安装
 echo "正在安装基础依赖..."
 run_cmd apk update
-run_cmd apk add curl gcompat ca-certificates unzip openrc iproute2 chrony openssl bind-tools
+run_cmd apk add curl gcompat ca-certificates unzip openrc iproute2 chrony openssl bind-tools python3
 
 # 创建必要目录
 run_cmd mkdir -p "$XRAY_DIR" "$(dirname "$XRAY_BIN")" /var/log /etc/local.d

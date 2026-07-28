@@ -331,6 +331,7 @@ curl -fsSL https://raw.githubusercontent.com/GaoYanHai/Alpine-3.8-/main/debian_x
 ```
 
 ### 排障
+- 若出现 `syntax error near unexpected token out=`：旧版 `json_escape` 反斜杠语法损坏，请拉取最新脚本
 - 若启用 SOCKS 时出现 `sed: unknown option to s`：是旧版用户名转义 bug，请拉取最新脚本重跑
 
 ### 安全建议
@@ -423,6 +424,10 @@ A: 容器权限常见限制，脚本会降级继续；一般不导致 -1ms。
 ---
 
 ## 📜 更新日志
+
+### v3.4.3（2026-07-28）— 修复 json_escape 语法错误
+- 修复 `bash: syntax error near unexpected token out="$out\\"`
+- `json_escape` 改为 python3/jq/awk 实现，去掉易碎 case 反斜杠分支
 
 ### v3.4.2（2026-07-28）— SOCKS 账号安全校验
 - 明确：SOCKS5 协议无强制复杂度，脚本增加安全校验
