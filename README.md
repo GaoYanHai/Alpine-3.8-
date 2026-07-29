@@ -427,6 +427,10 @@ A: 容器权限常见限制，脚本会降级继续；一般不导致 -1ms。
 
 ## 📜 更新日志
 
+### v3.4.6（2026-07-29）— 修复 syntax error near unexpected token (
+- 修复插入 SOCKS 自检时截断 `echo "正在获取公网 IP..."` 导致 bash 语法错误
+- 加固 SOCKS 本机测试输出
+
 ### v3.4.5（2026-07-28）— 修复卡在“正在生成配置文件”
 - 修复 `curl | bash` 场景下外部命令吞掉脚本 stdin，导致 heredoc 永久等待
 - 管道安装时自动落盘临时文件再 exec；xray uuid/x25519/test 统一 `</dev/null`

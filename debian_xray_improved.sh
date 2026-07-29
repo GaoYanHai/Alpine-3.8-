@@ -1070,7 +1070,6 @@ fi
 
 # 10. 输出安装结果
 echo ""
-echo "
 # SOCKS5 local self-check
 if [ "${ENABLE_SOCKS:-0}" = "1" ]; then
     echo ""
@@ -1089,12 +1088,14 @@ if [ "${ENABLE_SOCKS:-0}" = "1" ]; then
             --socks5-hostname "127.0.0.1:${SOCKS_PORT}" \
             -U "${SOCKS_USER}:${SOCKS_PASS}" \
             "https://api.ipify.org" >/tmp/socks-test.out 2>/tmp/socks-test.err; then
-            echo "SOCKS5 local proxy OK, egress IP: $(cat /tmp/socks-test.out 2>/dev/null)"
+            _socks_ip=$(tr -d '\r\n' </tmp/socks-test.out 2>/dev/null || true)
+            echo "SOCKS5 local proxy OK, egress IP: ${_socks_ip}"
             socks_ok=1
         elif curl -fsS --connect-timeout 8 --max-time 15 \
             -x "socks5h://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${SOCKS_PORT}" \
             "https://api.ipify.org" >/tmp/socks-test.out 2>/tmp/socks-test.err; then
-            echo "SOCKS5 local proxy OK, egress IP: $(cat /tmp/socks-test.out 2>/dev/null)"
+            _socks_ip=$(tr -d '\r\n' </tmp/socks-test.out 2>/dev/null || true)
+            echo "SOCKS5 local proxy OK, egress IP: ${_socks_ip}"
             socks_ok=1
         fi
     fi
@@ -1107,11 +1108,11 @@ if [ "${ENABLE_SOCKS:-0}" = "1" ]; then
     echo "  - open cloud security group TCP ${SOCKS_PORT}"
     echo "  - map LXD/LXC port ${SOCKS_PORT} separately from Reality port"
     echo "  - client must use SOCKS5 + username/password (not SOCKS4/noauth)"
-    echo "  lxc config device add <name> socksproxy proxy listen=tcp:0.0.0.0:${SOCKS_PORT} connect=tcp:127.0.0.1:${SOCKS_PORT}"
+    echo "  lxc example: lxc config device add INSTANCE socksproxy proxy listen=tcp:0.0.0.0:${SOCKS_PORT} connect=tcp:127.0.0.1:${SOCKS_PORT}"
     echo "  Test-NetConnection -ComputerName <public-ip> -Port ${SOCKS_PORT}"
 fi
 
-正在获取公网 IP..."
+echo "正在获取公网 IP..."
 CLEAR_IP=$(get_public_ip)
 PBK_ENC=$(urlencode "$PUB_KEY")
 SHARE_LINK="vless://${USER_UUID}@${CLEAR_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PBK_ENC}&sid=${SHORT_ID}&type=tcp#Debian-Reality-${PORT}"
