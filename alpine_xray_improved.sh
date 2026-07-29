@@ -1,4 +1,14 @@
 #!/bin/sh
+# ------------------------------------------------------------
+# curl|sh 防护：stdin 管道安装时先落盘再 exec，避免 heredoc 卡死
+# ------------------------------------------------------------
+if [ -z "${XRAY_SCRIPT_REEXEC:-}" ] && [ ! -f "$0" ]; then
+    _xray_tmp="$(mktemp /tmp/xray-install-XXXXXX.sh 2>/dev/null || mktemp)"
+    cat > "$_xray_tmp"
+    chmod +x "$_xray_tmp"
+    XRAY_SCRIPT_REEXEC=1 exec sh "$_xray_tmp" "$@"
+fi
+
 
 # ====================================================
 # Project: Alpine LXC Xray Reality One-Click Script
@@ -258,7 +268,7 @@ probe_sni_target() {
     fi
 
     if command -v openssl >/dev/null 2>&1; then
-        if echo | openssl s_client -tls1_3 -connect "${sni}:443" -servername "$sni" >/dev/null 2>&1; then
+        if openssl s_client -tls1_3 -connect "${sni}:443" -servername "$sni" </dev/null >/dev/null 2>&1; then
             score=$((score + 15))
             tls13=1
         fi
@@ -703,16 +713,16 @@ run_cmd unzip -o "$XRAY_ZIP" xray -d "$(dirname "$XRAY_BIN")"
 run_cmd chmod +x "$XRAY_BIN"
 
 # 验证 Xray 二进制文件可执行性
-if ! "$XRAY_BIN" version > /dev/null 2>&1; then
+if ! "$XRAY_BIN" version </dev/null > /dev/null 2>&1; then
     error_exit "Xray 二进制文件损坏或架构不兼容"
 fi
-echo "Xray 版本: $("$XRAY_BIN" version 2>/dev/null | head -n 1)"
+echo "Xray 版本: $("$XRAY_BIN" version </dev/null 2>/dev/null | head -n 1)"
 
 # 3. 动态生成身份凭证（安全提取）
 echo "正在生成加密密钥..."
-USER_UUID=$("$XRAY_BIN" uuid)
+USER_UUID=$("$XRAY_BIN" uuid </dev/null)
 
-KEYS_OUTPUT=$("$XRAY_BIN" x25519)
+KEYS_OUTPUT=$("$XRAY_BIN" x25519 </dev/null)
 echo "调试信息 - Xray x25519 输出:" >&2
 echo "$KEYS_OUTPUT" >&2
 
@@ -753,6 +763,7 @@ configure_socks_optional
 # - 日志改为 warning + 文件，便于排查“端口通但连不上 / 延迟 -1ms”
 # - shortIds 同时保留空值和固定值，兼容部分客户端默认空 shortId
 echo "正在生成配置文件..."
+echo "  (写入 $XRAY_CONFIG )"
 cat > "$XRAY_CONFIG" << CONF
 {
     "log": {
@@ -794,6 +805,7 @@ cat > "$XRAY_CONFIG" << CONF
     }]
 }
 CONF
+echo "  基础配置已写入"
 
 # 验证 JSON 配置文件格式（优先 jq，没有 jq 时做基础检查）
 if command -v jq >/dev/null 2>&1; then
@@ -849,7 +861,7 @@ if [ "${ENABLE_SOCKS:-0}" = "1" ]; then
 fi
 
 # 配置测试
-if ! "$XRAY_BIN" run -test -c "$XRAY_CONFIG" >/tmp/xray-test.out 2>&1; then
+if ! "$XRAY_BIN" run -test -c "$XRAY_CONFIG" </dev/null >/tmp/xray-test.out 2>&1; then
     echo "❌ Xray 配置测试失败:" >&2
     cat /tmp/xray-test.out >&2 || true
     error_exit "Xray 配置测试失败"

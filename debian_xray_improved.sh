@@ -1,4 +1,16 @@
 #!/bin/bash
+# ------------------------------------------------------------
+# curl|bash 防护：stdin 被管道喂脚本时，先整份落盘再 exec
+# 否则 xray/openssl/jq 等一旦读 stdin，会吃掉后续脚本，
+# 表现为卡在「正在生成配置文件...」(heredoc 永远等不到结束标记)
+# ------------------------------------------------------------
+if [ -z "${XRAY_SCRIPT_REEXEC:-}" ] && [ ! -f "$0" ]; then
+    _xray_tmp="$(mktemp /tmp/xray-install-XXXXXX.sh 2>/dev/null || mktemp)"
+    cat > "$_xray_tmp"
+    chmod +x "$_xray_tmp"
+    XRAY_SCRIPT_REEXEC=1 exec bash "$_xray_tmp" "$@"
+fi
+
 
 # ====================================================
 # Project: Debian LXD Xray Reality One-Click Script
@@ -270,7 +282,7 @@ probe_sni_target() {
 
     # openssl TLS1.3 复检（有则加分；明确失败且 curl 也没过 tls13 则淘汰）
     if command -v openssl >/dev/null 2>&1; then
-        if echo | timeout 5 openssl s_client -tls1_3 -connect "${sni}:443" -servername "$sni" >/dev/null 2>&1; then
+        if timeout 5 openssl s_client -tls1_3 -connect "${sni}:443" -servername "$sni" </dev/null >/dev/null 2>&1; then
             score=$((score + 15))
             tls13=1
         fi
@@ -729,10 +741,10 @@ fi
 run_cmd unzip -o "$XRAY_ZIP" xray -d "$(dirname "$XRAY_BIN")"
 run_cmd chmod +x "$XRAY_BIN"
 
-if ! "$XRAY_BIN" version >/dev/null 2>&1; then
+if ! "$XRAY_BIN" version </dev/null >/dev/null 2>&1; then
     error_exit "Xray 二进制文件损坏或架构不兼容"
 fi
-echo "Xray 版本: $("$XRAY_BIN" version 2>/dev/null | head -n 1)"
+echo "Xray 版本: $("$XRAY_BIN" version </dev/null 2>/dev/null | head -n 1)"
 
 # 2.5 自动检测最优伪装目标（多地域 + 严格校验）
 # 不可达/无 TLS1.3 的 SNI 直接拒绝安装，避免客户端 -1ms
@@ -747,8 +759,8 @@ echo "将使用: SNI=$SNI  DEST=$DEST_SITE  region=$(sni_region_of "$SNI")"
 # 3. 动态生成身份凭证
 echo ""
 echo "正在生成加密密钥..."
-USER_UUID=$("$XRAY_BIN" uuid)
-KEYS_OUTPUT=$("$XRAY_BIN" x25519)
+USER_UUID=$("$XRAY_BIN" uuid </dev/null)
+KEYS_OUTPUT=$("$XRAY_BIN" x25519 </dev/null)
 
 echo "调试信息 - Xray x25519 输出:" >&2
 echo "$KEYS_OUTPUT" >&2
@@ -789,6 +801,7 @@ configure_socks_optional
 
 # 4. 生成 Xray 配置文件
 echo "正在生成配置文件..."
+echo "  (写入 $XRAY_CONFIG )"
 touch "$XRAY_LOG" 2>/dev/null || true
 chown "$XRAY_USER:$XRAY_GROUP" "$XRAY_LOG" 2>/dev/null || true
 
@@ -833,6 +846,7 @@ cat > "$XRAY_CONFIG" << CONF
     }]
 }
 CONF
+echo "  基础配置已写入"
 
 if ! jq empty "$XRAY_CONFIG" 2>/dev/null; then
     error_exit "配置文件 JSON 格式错误"
@@ -972,7 +986,7 @@ run_cmd chmod 755 "$XRAY_BIN"
 touch "$XRAY_LOG" 2>/dev/null || true
 chmod 666 "$XRAY_LOG" 2>/dev/null || chmod 644 "$XRAY_LOG" 2>/dev/null || true
 
-if ! "$XRAY_BIN" run -test -c "$XRAY_CONFIG" >/tmp/xray-test.out 2>&1; then
+if ! "$XRAY_BIN" run -test -c "$XRAY_CONFIG" </dev/null >/tmp/xray-test.out 2>&1; then
     echo "❌ Xray 配置测试失败，输出如下：" >&2
     cat /tmp/xray-test.out >&2 || true
     error_exit "Xray 配置测试失败"

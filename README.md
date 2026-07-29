@@ -331,6 +331,8 @@ curl -fsSL https://raw.githubusercontent.com/GaoYanHai/Alpine-3.8-/main/debian_x
 ```
 
 ### 排障
+- **卡在「正在生成配置文件...」**：旧版在 `curl|bash` 下可能被 stdin 吞脚本；请拉最新脚本，或改用：
+  `curl -fsSL ... -o install.sh && bash install.sh`
 - 若出现 `syntax error near unexpected token out=`：旧版 `json_escape` 反斜杠语法损坏，请拉取最新脚本
 - 若启用 SOCKS 时出现 `sed: unknown option to s`：是旧版用户名转义 bug，请拉取最新脚本重跑
 
@@ -424,6 +426,10 @@ A: 容器权限常见限制，脚本会降级继续；一般不导致 -1ms。
 ---
 
 ## 📜 更新日志
+
+### v3.4.5（2026-07-28）— 修复卡在“正在生成配置文件”
+- 修复 `curl | bash` 场景下外部命令吞掉脚本 stdin，导致 heredoc 永久等待
+- 管道安装时自动落盘临时文件再 exec；xray uuid/x25519/test 统一 `</dev/null`
 
 ### v3.4.4（2026-07-28）— 修复 SOCKS5 一直连接中
 - 改用 jq 合并 SOCKS 入站，避免 heredoc 拼接异常
