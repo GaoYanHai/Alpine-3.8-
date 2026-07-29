@@ -449,9 +449,9 @@ validate_port() {
 }
 
 
-# SOCKS5 协议本身几乎不限制账号格式；这里做“安全可用性”校验，避免弱口令公网裸奔
-# 用户名: 1-64，字母数字._-@
-# 密码: 8-128；至少包含字母+数字；允许大小写/符号；禁止与用户名相同、禁止常见弱口令
+# SOCKS5 账号：用户名做基础兼容校验；密码不做强度/长度限制（仅非空）
+# 用户名: 1-64，字母数字._@+-
+# 密码: 任意非空字符串（允许纯数字/短密码，兼容 TG 等场景）
 validate_socks_username() {
     u="$1"
     len=$(printf %s "$u" | wc -c | tr -d ' ')
@@ -474,55 +474,10 @@ validate_socks_username() {
 
 validate_socks_password() {
     p="$1"
-    u="${2-}"
-    len=$(printf %s "$p" | wc -c | tr -d ' ')
-    if [ "$len" -lt 8 ] || [ "$len" -gt 128 ]; then
-        echo "密码长度须为 8-128 个字符（当前: $len）" >&2
+    # 不做长度/复杂度/弱口令校验，仅要求非空
+    if [ -z "$p" ]; then
+        echo "密码不能为空" >&2
         return 1
-    fi
-    if printf %s "$p" | grep -q '[[:space:]]'; then
-        echo "密码不能包含空格/空白字符" >&2
-        return 1
-    fi
-    # 至少同时有字母和数字（不强制大小写混合，避免过于苛刻；但会提示）
-    has_alpha=0
-    has_digit=0
-    has_upper=0
-    has_lower=0
-    has_special=0
-    printf %s "$p" | grep -Eq '[A-Za-z]' && has_alpha=1
-    printf %s "$p" | grep -Eq '[0-9]' && has_digit=1
-    printf %s "$p" | grep -Eq '[A-Z]' && has_upper=1
-    printf %s "$p" | grep -Eq '[a-z]' && has_lower=1
-    printf %s "$p" | grep -Eq '[^A-Za-z0-9]' && has_special=1
-
-    if [ "$has_alpha" -ne 1 ] || [ "$has_digit" -ne 1 ]; then
-        echo "密码须同时包含字母和数字" >&2
-        return 1
-    fi
-    if [ -n "$u" ] && [ "$p" = "$u" ]; then
-        echo "密码不能与用户名相同" >&2
-        return 1
-    fi
-    # 常见弱口令黑名单（小写比较）
-    pl=$(printf %s "$p" | tr 'A-Z' 'a-z')
-    case "$pl" in
-        12345678|password|password1|qwerty123|admin123|socks123|abcdefg1|11111111|00000000|deuser0001|user1234|passw0rd)
-            echo "密码过于常见/弱，请更换" >&2
-            return 1
-            ;;
-    esac
-    # 连续相同字符过多
-    if printf %s "$p" | grep -Eq '(.)\1\1\1\1'; then
-        echo "密码包含过多连续重复字符" >&2
-        return 1
-    fi
-
-    # 非强制：给出强度提示
-    score=$((has_alpha + has_digit + has_upper + has_lower + has_special))
-    if [ "$len" -ge 12 ]; then score=$((score + 1)); fi
-    if [ "$score" -lt 4 ]; then
-        echo "提示: 建议密码含大小写+数字+符号，且不少于 12 位（当前可过校验，但偏弱）" >&2
     fi
     return 0
 }
@@ -540,7 +495,7 @@ prompt_socks_credentials() {
                 SOCKS_USER=$(prompt_input "SOCKS5 用户名（1-64，字母数字._@+-）" "${SOCKS_USER}")
             fi
             if [ -z "$SOCKS_PASS" ] || [ "$tries" -gt 1 ]; then
-                SOCKS_PASS=$(prompt_input "SOCKS5 密码（>=8，须含字母+数字）" "")
+                SOCKS_PASS=$(prompt_input "SOCKS5 密码（任意非空，不做强度校验）" "")
             fi
         fi
 
@@ -639,8 +594,8 @@ configure_socks_optional() {
         error_exit "SOCKS5 端口不能与 Reality 端口相同 ($PORT)"
     fi
 
-    # 用户名/密码：启用则必填 + 安全校验
-    echo "账号要求: 用户名 1-64（字母数字._@+-）；密码 8-128，须含字母+数字，且不能与用户名相同"
+    # 用户名/密码：启用则必填；密码不做强度校验
+    echo "账号要求: 用户名 1-64（字母数字._@+-）；密码任意非空（不做长度/复杂度校验）"
     prompt_socks_credentials
 
     su_esc=$(json_escape "$SOCKS_USER") || error_exit "SOCKS user escape failed"
@@ -1104,12 +1059,24 @@ if [ "${ENABLE_SOCKS:-0}" = "1" ]; then
         tail -n 50 "$XRAY_LOG" 2>/dev/null || true
         [ -f /tmp/socks-test.err ] && cat /tmp/socks-test.err 2>/dev/null || true
     fi
-    echo "If local OK but client stays Connecting:"
-    echo "  - open cloud security group TCP ${SOCKS_PORT}"
-    echo "  - map LXD/LXC port ${SOCKS_PORT} separately from Reality port"
-    echo "  - client must use SOCKS5 + username/password (not SOCKS4/noauth)"
-    echo "  lxc example: lxc config device add INSTANCE socksproxy proxy listen=tcp:0.0.0.0:${SOCKS_PORT} connect=tcp:127.0.0.1:${SOCKS_PORT}"
-    echo "  Test-NetConnection -ComputerName <public-ip> -Port ${SOCKS_PORT}"
+
+    echo "======================================================"
+    echo "CRITICAL: SOCKS port is NOT the same as Reality port"
+    echo "  Reality may work on TCP ${PORT}, while SOCKS needs TCP ${SOCKS_PORT}"
+    echo "  LXD/NAT/security-group usually allow ports ONE BY ONE"
+    echo "  ss listening inside container != reachable from internet"
+    echo "======================================================"
+    echo "Do these now on HOST (not only inside container):"
+    echo "  1) Cloud security group: allow inbound TCP ${SOCKS_PORT}"
+    echo "  2) LXD proxy (host):"
+    echo "     lxc config device add ${HOSTNAME:-INSTANCE} socks${SOCKS_PORT} proxy listen=tcp:0.0.0.0:${SOCKS_PORT} connect=tcp:127.0.0.1:${SOCKS_PORT}"
+    echo "     # if connect fails, try container eth IP instead of 127.0.0.1"
+    echo "  3) From your PC (not VPS):"
+    echo "     Test-NetConnection -ComputerName <PUBLIC_IP> -Port ${PORT}"
+    echo "     Test-NetConnection -ComputerName <PUBLIC_IP> -Port ${SOCKS_PORT}"
+    echo "     # Expect BOTH True. If 52300 True and ${SOCKS_PORT} False => mapping/SG issue"
+    echo "  4) Inside container local SOCKS proof:"
+    echo "     curl -fsS --socks5-hostname 127.0.0.1:${SOCKS_PORT} -U \"${SOCKS_USER}:${SOCKS_PASS}\" https://api.ipify.org"
 fi
 
 echo "正在获取公网 IP..."

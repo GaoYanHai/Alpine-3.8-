@@ -386,7 +386,21 @@ echo ""
 
 # 总结
 echo "=========================================="
-echo "📊 诊断汇总"
+echo "📊 
+# Extra: Reality port vs SOCKS port misconception
+echo "=========================================="
+echo "Reality port vs other inbound ports"
+echo "=========================================="
+echo "Inside-container listening only proves local process bind."
+echo "On LXD/NAT, each TCP port usually needs its own:"
+echo "  - cloud security group rule"
+echo "  - lxc proxy / iptables DNAT / panel port map"
+echo "So TCP 52300 reachable does NOT imply TCP <SOCKS_PORT> reachable."
+echo "From your PC compare:"
+echo "  Test-NetConnection IP -Port 52300"
+echo "  Test-NetConnection IP -Port <SOCKS_PORT>"
+echo ""
+诊断汇总"
 echo "=========================================="
 echo "通过: $SCORE_OK   警告: $SCORE_WARN   严重: $SCORE_BAD"
 echo ""
