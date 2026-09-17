@@ -72,6 +72,12 @@ XRAY_DIR="/etc/xray"
 XRAY_LOG="/var/log/xray.log"
 SHARE_FILE="/etc/xray/client-link.txt"
 
+CLASH_FILE="/etc/xray/clash-meta.yaml"
+XRAY_CLIENT_FILE="/etc/xray/xray-client.json"
+CLIENT_NODE_NAME="Alpine-Reality"
+CLASH_SUB_URL=""
+CLASH_SUB_URL_BACKUP=""
+
 # 错误处理函数
 error_exit() {
     echo "❌ 错误: $1" >&2
@@ -208,6 +214,20 @@ urlencode() {
     # 最小实现：对 Reality 分享链接中需要的字符做编码
     printf %s "$1" | sed 's/+/%2B/g; s/\//%2F/g; s/=/%3D/g'
 }
+
+urlencode_all() {
+    # 订阅链接要把整个 vless:// 做百分号编码
+    if command -v python3 >/dev/null 2>&1; then
+        printf %s "$1" | python3 -c 'import sys,urllib.parse; sys.stdout.write(urllib.parse.quote(sys.stdin.read(), safe=""))'
+        return 0
+    fi
+    if command -v jq >/dev/null 2>&1; then
+        jq -rn --arg s "$1" '$s|@uri'
+        return 0
+    fi
+    printf %s "$1" | sed 's/+/%2B/g; s/\//%2F/g; s/=/%3D/g; s/:/%3A/g; s/?/%3F/g; s/&/%26/g; s/#/%23/g'
+}
+
 
 
 
@@ -413,6 +433,441 @@ json_escape() {
 
 
 
+
+# ------------------------------------------------------------
+# ACL4SSR 客户端分流（规则模式，不要开全局）
+# 规则思路对齐 https://github.com/ACL4SSR/ACL4SSR
+# 安装后生成:
+#   /etc/xray/clash-meta.yaml     Clash Verge / mihomo
+#   /etc/xray/xray-client.json    NekoBox / v2rayN 自定义 / Xray
+# ------------------------------------------------------------
+CLASH_FILE="${CLASH_FILE:-/etc/xray/clash-meta.yaml}"
+XRAY_CLIENT_FILE="${XRAY_CLIENT_FILE:-/etc/xray/xray-client.json}"
+CLIENT_NODE_NAME="${CLIENT_NODE_NAME:-Reality}"
+
+write_client_routing_files() {
+    node_name="${CLIENT_NODE_NAME:-Reality}"
+    client_addr="${CLEAR_IP:-YOUR_PUBLIC_IP}"
+    if ! echo "$client_addr" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        client_addr="YOUR_PUBLIC_IP"
+    fi
+    acl_cdn="https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash"
+
+    cat > "$CLASH_FILE" << YAML
+# Clash Meta / mihomo
+# 分流规则来源: ACL4SSR (https://github.com/ACL4SSR/ACL4SSR)
+# 请使用「规则模式」(mode: rule)，不要开全局模式
+mixed-port: 7890
+allow-lan: false
+bind-address: 127.0.0.1
+mode: rule
+log-level: info
+ipv6: false
+unified-delay: true
+tcp-concurrent: true
+external-controller: 127.0.0.1:9090
+
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
+    - localhost.ptlogin2.qq.com
+    - "+.srv.nintendo.net"
+    - "+.stun.playstation.net"
+    - "xbox.*.microsoft.com"
+    - "*.msftconnecttest.com"
+    - "*.msftncsi.com"
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+  fallback:
+    - https://dns.google/dns-query
+    - https://cloudflare-dns.com/dns-query
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+      - 240.0.0.0/4
+
+proxies:
+  - name: ${node_name}
+    type: vless
+    server: ${client_addr}
+    port: ${PORT}
+    uuid: ${USER_UUID}
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: ${SNI}
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: ${PUB_KEY}
+      short-id: ${SHORT_ID}
+
+proxy-groups:
+  - name: 🚀 节点选择
+    type: select
+    proxies:
+      - ♻️ 自动选择
+      - ${node_name}
+      - DIRECT
+  - name: ♻️ 自动选择
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    proxies:
+      - ${node_name}
+  - name: 🌍 国外媒体
+    type: select
+    proxies:
+      - 🚀 节点选择
+      - 🎯 全球直连
+  - name: 📲 电报信息
+    type: select
+    proxies:
+      - 🚀 节点选择
+      - 🎯 全球直连
+  - name: 💬 OpenAi
+    type: select
+    proxies:
+      - 🚀 节点选择
+      - 🎯 全球直连
+  - name: Ⓜ️ 微软服务
+    type: select
+    proxies:
+      - 🎯 全球直连
+      - 🚀 节点选择
+      - DIRECT
+  - name: 🍎 苹果服务
+    type: select
+    proxies:
+      - 🚀 节点选择
+      - 🎯 全球直连
+      - DIRECT
+  - name: 🌏 国内媒体
+    type: select
+    proxies:
+      - 🎯 全球直连
+      - 🚀 节点选择
+  - name: 🎯 全球直连
+    type: select
+    proxies:
+      - DIRECT
+      - 🚀 节点选择
+  - name: 🛑 广告拦截
+    type: select
+    proxies:
+      - REJECT
+      - DIRECT
+  - name: 🍃 应用净化
+    type: select
+    proxies:
+      - REJECT
+      - DIRECT
+  - name: 🐟 漏网之鱼
+    type: select
+    proxies:
+      - 🚀 节点选择
+      - 🎯 全球直连
+      - DIRECT
+
+rule-providers:
+  LocalAreaNetwork:
+    type: http
+    behavior: classical
+    url: "${acl_cdn}/LocalAreaNetwork.list"
+    path: ./ruleset/LocalAreaNetwork.yaml
+    interval: 86400
+  UnBan:
+    type: http
+    behavior: classical
+    url: "${acl_cdn}/UnBan.list"
+    path: ./ruleset/UnBan.yaml
+    interval: 86400
+  BanAD:
+    type: http
+    behavior: classical
+    url: "${acl_cdn}/BanAD.list"
+    path: ./ruleset/BanAD.yaml
+    interval: 86400
+  BanProgramAD:
+    type: http
+    behavior: classical
+    url: "${acl_cdn}/BanProgramAD.list"
+    path: ./ruleset/BanProgramAD.yaml
+    interval: 86400
+  GoogleCN:
+    type: http
+    behavior: classical
+    url: "${acl_cdn}/GoogleCN.list"
+    path: ./ruleset/GoogleCN.yaml
+    interval: 86400
+  SteamCN:
+    type: http
+    behavior: classical
+    url: "${acl_cdn}/Ruleset/SteamCN.list"
+    path: ./ruleset/SteamCN.yaml
+    interval: 86400
+  Microsoft:
+    type: http
+    behavior: classical
+    url: "${acl_cdn}/Microsoft.list"
+    path: ./ruleset/Microsoft.yaml
+    interval: 86400
+  Apple:
+    type: http
+    behavior: classical
+    url: "${acl_cdn}/Apple.list"
+    path: ./ruleset/Apple.yaml
+    interval: 86400
+  Telegram:
+    type: http
+    behavior: classical
+    url: "${acl_cdn}/Telegram.list"
+    path: ./ruleset/Telegram.yaml
+    interval: 86400
+  OpenAi:
+    type: http
+    behavior: classical
+    url: "${acl_cdn}/Ruleset/OpenAi.list"
+    path: ./ruleset/OpenAi.yaml
+    interval: 86400
+  ProxyMedia:
+    type: http
+    behavior: classical
+    url: "${acl_cdn}/ProxyMedia.list"
+    path: ./ruleset/ProxyMedia.yaml
+    interval: 86400
+  ProxyGFWlist:
+    type: http
+    behavior: classical
+    url: "${acl_cdn}/ProxyGFWlist.list"
+    path: ./ruleset/ProxyGFWlist.yaml
+    interval: 86400
+  ChinaMedia:
+    type: http
+    behavior: classical
+    url: "${acl_cdn}/ChinaMedia.list"
+    path: ./ruleset/ChinaMedia.yaml
+    interval: 86400
+  ChinaDomain:
+    type: http
+    behavior: classical
+    url: "${acl_cdn}/ChinaDomain.list"
+    path: ./ruleset/ChinaDomain.yaml
+    interval: 86400
+  ChinaCompanyIp:
+    type: http
+    behavior: classical
+    url: "${acl_cdn}/ChinaCompanyIp.list"
+    path: ./ruleset/ChinaCompanyIp.yaml
+    interval: 86400
+
+rules:
+  - RULE-SET,LocalAreaNetwork,🎯 全球直连
+  - RULE-SET,UnBan,🎯 全球直连
+  - RULE-SET,BanAD,🛑 广告拦截
+  - RULE-SET,BanProgramAD,🍃 应用净化
+  - RULE-SET,GoogleCN,🎯 全球直连
+  - RULE-SET,SteamCN,🎯 全球直连
+  - RULE-SET,Microsoft,Ⓜ️ 微软服务
+  - RULE-SET,Apple,🍎 苹果服务
+  - RULE-SET,Telegram,📲 电报信息
+  - RULE-SET,OpenAi,💬 OpenAi
+  - RULE-SET,ProxyMedia,🌍 国外媒体
+  - RULE-SET,ProxyGFWlist,🚀 节点选择
+  - RULE-SET,ChinaMedia,🌏 国内媒体
+  - RULE-SET,ChinaDomain,🎯 全球直连
+  - RULE-SET,ChinaCompanyIp,🎯 全球直连
+  - GEOSITE,private,🎯 全球直连
+  - GEOSITE,category-ads-all,🛑 广告拦截
+  - GEOSITE,openai,💬 OpenAi
+  - GEOSITE,telegram,📲 电报信息
+  - GEOSITE,google,🚀 节点选择
+  - GEOSITE,gfw,🚀 节点选择
+  - "GEOSITE,geolocation-!cn,🚀 节点选择"
+  - GEOSITE,cn,🎯 全球直连
+  - GEOIP,telegram,📲 电报信息
+  - GEOIP,LAN,🎯 全球直连
+  - GEOIP,CN,🎯 全球直连
+  - MATCH,🐟 漏网之鱼
+YAML
+
+    cat > "$XRAY_CLIENT_FILE" << JSON
+{
+    "log": {
+        "loglevel": "warning"
+    },
+    "inbounds": [
+        {
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "port": 10808,
+            "protocol": "socks",
+            "settings": {
+                "udp": true
+            },
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls", "quic"]
+            }
+        },
+        {
+            "tag": "http-in",
+            "listen": "127.0.0.1",
+            "port": 10809,
+            "protocol": "http",
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls", "quic"]
+            }
+        }
+    ],
+    "outbounds": [
+        {
+            "tag": "proxy",
+            "protocol": "vless",
+            "settings": {
+                "vnext": [{
+                    "address": "${client_addr}",
+                    "port": ${PORT},
+                    "users": [{
+                        "id": "${USER_UUID}",
+                        "encryption": "none",
+                        "flow": "xtls-rprx-vision"
+                    }]
+                }]
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "serverName": "${SNI}",
+                    "fingerprint": "chrome",
+                    "publicKey": "${PUB_KEY}",
+                    "shortId": "${SHORT_ID}",
+                    "spiderX": "/"
+                }
+            }
+        },
+        {
+            "tag": "direct",
+            "protocol": "freedom",
+            "settings": {}
+        },
+        {
+            "tag": "block",
+            "protocol": "blackhole",
+            "settings": {}
+        }
+    ],
+    "routing": {
+        "domainStrategy": "IPIfNonMatch",
+        "rules": [
+            {
+                "type": "field",
+                "domain": ["geosite:category-ads-all"],
+                "outboundTag": "block"
+            },
+            {
+                "type": "field",
+                "protocol": ["bittorrent"],
+                "outboundTag": "direct"
+            },
+            {
+                "type": "field",
+                "domain": ["geosite:private"],
+                "outboundTag": "direct"
+            },
+            {
+                "type": "field",
+                "ip": ["geoip:private"],
+                "outboundTag": "direct"
+            },
+            {
+                "type": "field",
+                "domain": [
+                    "geosite:google",
+                    "geosite:youtube",
+                    "geosite:telegram",
+                    "geosite:twitter",
+                    "geosite:facebook",
+                    "geosite:gfw",
+                    "geosite:geolocation-!cn"
+                ],
+                "outboundTag": "proxy"
+            },
+            {
+                "type": "field",
+                "ip": ["geoip:telegram"],
+                "outboundTag": "proxy"
+            },
+            {
+                "type": "field",
+                "domain": ["geosite:cn"],
+                "outboundTag": "direct"
+            },
+            {
+                "type": "field",
+                "ip": ["geoip:cn"],
+                "outboundTag": "direct"
+            }
+        ]
+    }
+}
+JSON
+
+
+    CLASH_SUB_URL=""
+    CLASH_SUB_URL_BACKUP=""
+    if [ -n "${SHARE_LINK:-}" ]; then
+        _vless_enc=$(urlencode_all "$SHARE_LINK") || _vless_enc=""
+        _cfg="https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/config/ACL4SSR_Online.ini"
+        _cfg_enc=$(urlencode_all "$_cfg") || _cfg_enc=""
+        if [ -n "$_vless_enc" ] && [ -n "$_cfg_enc" ]; then
+            _qs="target=clash&insert=false&emoji=true&list=false&udp=true&scv=true&fdn=false&sort=false&new_name=true&filename=${node_name}&url=${_vless_enc}&config=${_cfg_enc}"
+            CLASH_SUB_URL="https://api.v1.mk/sub?${_qs}"
+            CLASH_SUB_URL_BACKUP="https://sub.xeton.dev/sub?${_qs}"
+        fi
+    fi
+
+    if [ -f "$SHARE_FILE" ]; then
+        cat >> "$SHARE_FILE" << NOTE
+
+Clash 订阅（和机场一样粘贴即可，自动生成直连/苹果/漏网之鱼等分组）:
+$CLASH_SUB_URL
+
+备用订阅:
+$CLASH_SUB_URL_BACKUP
+
+用法: Clash Verge / mihomo → 新建订阅 → 粘贴上面链接 → 更新
+      模式选「规则」，不要开全局。这不是 vless:// 单节点链接。
+
+本地备份配置:
+  Clash Meta: $CLASH_FILE
+  Xray / NekoBox: $XRAY_CLIENT_FILE
+  规则来源: https://github.com/ACL4SSR/ACL4SSR
+NOTE
+    fi
+
+    echo "✅ 已生成 Clash 订阅（导入后自动出 ACL4SSR 分组）"
+    if [ -n "$CLASH_SUB_URL" ]; then
+        echo "  $CLASH_SUB_URL"
+    fi
+    echo "  本地备份: $CLASH_FILE"
+    if [ "$client_addr" = "YOUR_PUBLIC_IP" ]; then
+        echo "⚠️  未检测到公网 IP，请把配置里的 YOUR_PUBLIC_IP 改成宿主机公网 IP"
+    fi
+}
 
 is_truthy() {
     case "$(printf %s "$1" | tr "A-Z" "a-z")" in
@@ -1039,6 +1494,8 @@ $SOCKS_INFO_TEXT
 $SHARE_LINK
 LINKEOF
 
+write_client_routing_files
+
 cat << EOF
 -------------------------------------------------------
 ✅ 安装成功！请妥善保存以下连接参数：
@@ -1061,6 +1518,18 @@ $SHARE_LINK
 
 参数已保存: $SHARE_FILE
 -------------------------------------------------------
+🧭 Clash 订阅（和机场一样，粘贴后自动出直连/苹果/漏网之鱼等分组）:
+$CLASH_SUB_URL
+
+备用:
+$CLASH_SUB_URL_BACKUP
+
+  用法: 打开 Clash Verge / mihomo → 导入订阅 → 粘贴上面整段链接 → 更新
+        模式保持「规则」，不要开全局
+        不要把这条当 vless:// 用 v2rayN 导入
+  规则: ACL4SSR_Online  https://github.com/ACL4SSR/ACL4SSR
+  本地备份: $CLASH_FILE
+-------------------------------------------------------
 🚨 客户端延迟一直是 -1ms 时，按这个顺序查（90% 是前 3 项）:
   1) 云厂商安全组 / 防火墙是否放行 TCP $PORT 入站
   2) LXC 宿主机是否做了端口映射/转发到容器 $PORT
@@ -1074,6 +1543,8 @@ $SHARE_LINK
 🔒 安全提示:
   • 请不要在公共评论区贴出以上信息！
   • 配置文件位于: $XRAY_CONFIG
+  • Clash 分流配置: $CLASH_FILE
+  • Xray 客户端分流: $XRAY_CLIENT_FILE
   • 启动脚本位于: /etc/local.d/xray.start
   • 停止脚本位于: /etc/local.d/xray.stop
   • 日志文件位于: $XRAY_LOG

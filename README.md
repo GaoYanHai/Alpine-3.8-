@@ -12,6 +12,24 @@
 
 ---
 
+## 🆕 更新说明（2026-09-17）
+
+### 新增：ACL4SSR 客户端分流（不要开全局模式）
+
+导入 `vless://` 后如果开「全局模式」，国内网站也会绕一圈出国，又慢又浪费流量。
+安装脚本现在会按 [ACL4SSR](https://github.com/ACL4SSR/ACL4SSR) 生成**规则模式**配置：
+
+- 国内网站 / 国内 IP / 局域网 → 直连
+- 广告与应用净化 → 拦截
+- Google / Telegram / OpenAI / GFW 列表 → 走 Reality 节点
+- 其余流量进「漏网之鱼」，默认仍走代理
+
+安装结束会打印一条 **Clash 订阅链接**。把它粘到 Clash Verge / mihomo 的「新建订阅」，和机场一样，自动出现直连、苹果、漏网之鱼等分组。
+
+`vless://` 只含节点，不会带分组；v2rayN 导入分享链接也看不到这些策略组。
+
+---
+
 ## 🆕 更新说明（2026-07-28c）
 
 ### 新增：可选 SOCKS5 入站开关
@@ -86,6 +104,7 @@
 | 🕒 自我修复 | 每天 04:00 自动重启，缓解小内存 OOM |
 | ⚡ 下载重试 | Xray 二进制下载失败自动重试 3 次 |
 | ✅ 配置验证 | JSON / `xray run -test` / 关键字段校验 |
+| 🧭 ACL4SSR 分流 | 安装后生成 Clash Meta / Xray 客户端规则配置，国内直连、广告拦截，无需全局模式 |
 
 ### 版本支持矩阵
 
@@ -142,10 +161,14 @@ sudo sh xray-diagnostic.sh
 
 安装结束后终端会输出参数，并保存到：
 
-- `/etc/xray/client-link.txt`
-- 配置文件：`/etc/xray/config.json`
+- `/etc/xray/client-link.txt` — 参数与分享链接
+- `/etc/xray/config.json` — 服务端配置
+- `/etc/xray/clash-meta.yaml` — Clash 规则模式分流
+- `/etc/xray/xray-client.json` — Xray 客户端分流
 
-**推荐直接导入分享链接**，少手填。
+**推荐用法：把安装结束时打印的 Clash 订阅链接，粘到 Clash Verge / mihomo，和机场一样「新建订阅」。**
+导入后会自动出现直连、苹果、漏网之鱼等分组；模式保持「规则」，不要开全局。
+`vless://` 只是单节点，不会带分组。
 
 | 配置项 | 值 | 说明 |
 |--------|----|------|
@@ -180,6 +203,36 @@ Hash32:     <不是客户端公钥，不要填>
 | Hash32 | **不要填进客户端** |
 
 脚本已自动把 `Password` 映射并打印为 `PublicKey`，按终端输出填写即可。
+
+### 🧭 分流规则（ACL4SSR，和机场一样导入订阅）
+
+机场能自动出「直连 / 苹果 / 漏网之鱼」，是因为订阅内容本身就是 Clash 配置 + ACL4SSR 规则。
+`vless://` 只有节点，所以用 v2rayN 导入分享链接**不会**出现那些分组。
+
+安装结束后，终端和 `/etc/xray/client-link.txt` 会给出 **Clash 订阅链接**（走 ACL4SSR_Online 转换）。
+
+1. 打开你平时导入机场的 **Clash Verge / mihomo**
+2. 新建订阅，把那条 `https://api.v1.mk/sub?...` 整段贴进去
+3. 点更新；模式保持 **Rule / 规则**，不要开全局
+
+这样就会自动出现直连、苹果、国外媒体、漏网之鱼等分组，不用从 VPS 拷 yaml。
+
+| 客户端 | 怎么用 |
+|--------|--------|
+| Clash Verge / mihomo | **只贴 Clash 订阅链接**（推荐，和机场相同） |
+| v2rayN | 只能导入 `vless://` 当节点，没有这些策略组；路由请选「绕过大陆」 |
+| 订阅打不开时 | 备用 `https://sub.xeton.dev/sub?...`，或本地 `/etc/xray/clash-meta.yaml` |
+
+规则模板：[ACL4SSR_Online.ini](https://github.com/ACL4SSR/ACL4SSR/blob/master/Clash/config/ACL4SSR_Online.ini)
+
+常见策略：
+
+- 🎯 全球直连：局域网、国内域名、国内 IP、Steam 国服、Google 中国
+- 🛑 广告拦截 / 🍃 应用净化：广告与追踪
+- 📲 电报 / 💬 OpenAI / 🌍 国外媒体 / GFW 列表：走 Reality
+- Ⓜ️ 微软：默认直连（可在分组里改成节点）
+- 🍎 苹果：默认走节点（可改直连）
+- 🐟 漏网之鱼：默认走节点
 
 ---
 
@@ -404,6 +457,7 @@ A: 容器权限常见限制，脚本会降级继续；一般不导致 -1ms。
 | `debian_xray_improved.sh` | Debian/systemd 一键安装 |
 | `xray-diagnostic.sh` | 连通性/ -1ms 诊断 |
 | `README.md` | 本文档 |
+| `examples/clash-meta-acl4ssr.yaml` | ACL4SSR Clash 规则模板（填 YOUR_* 后导入） |
 
 安装后关键路径：
 
@@ -411,6 +465,8 @@ A: 容器权限常见限制，脚本会降级继续；一般不导致 -1ms。
 |------|------|
 | `/etc/xray/config.json` | Xray 配置 |
 | `/etc/xray/client-link.txt` | 客户端参数与分享链接 |
+| `/etc/xray/clash-meta.yaml` | Clash Meta ACL4SSR 规则配置 |
+| `/etc/xray/xray-client.json` | Xray 客户端分流配置 |
 | `/var/log/xray.log` | 业务日志 |
 | `/usr/local/bin/xray` | 核心二进制 |
 
@@ -426,6 +482,12 @@ A: 容器权限常见限制，脚本会降级继续；一般不导致 -1ms。
 ---
 
 ## 📜 更新日志
+
+### v3.5（2026-09-17）— ACL4SSR 客户端分流
+- 安装后打印 Clash 订阅链接：粘贴到 Clash Verge 即自动生成 ACL4SSR 分组（和机场一样）
+- 规则模板为 [ACL4SSR_Online](https://github.com/ACL4SSR/ACL4SSR/blob/master/Clash/config/ACL4SSR_Online.ini)
+- 同时生成本地备份 `/etc/xray/clash-meta.yaml` 与 `/etc/xray/xray-client.json`
+- 国内直连、广告拦截、GFW/Telegram/OpenAI 走代理，不再需要全局模式
 
 ### v3.4.8（2026-07-29）— 取消 SOCKS 密码长度强制限制
 - 去掉密码必须 8-128 位的校验，兼容 Telegram 等短密码场景
