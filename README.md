@@ -148,8 +148,8 @@ sudo sh xray-diagnostic.sh
 - `/etc/xray/clash-meta.yaml` — Clash 规则模式分流
 - `/etc/xray/xray-client.json` — Xray 客户端分流
 
-**推荐用法：把安装结束时打印的 Clash 订阅链接，粘到 Clash Verge / mihomo，和机场一样「新建订阅」。**
-导入后会自动出现直连、苹果、漏网之鱼等分组；模式保持「规则」，不要开全局。
+**推荐用法：把安装结束时打印的本机 Clash 订阅链接，粘到 Clash Verge / mihomo「新建订阅」。**
+这条链接指向你自己的 VPS，不经过第三方转换站。导入后自动出现直连、苹果、漏网之鱼等分组；模式保持「规则」。
 `vless://` 只是单节点，不会带分组。
 
 | 配置项 | 值 | 说明 |
@@ -186,24 +186,27 @@ Hash32:     <不是客户端公钥，不要填>
 
 脚本已自动把 `Password` 映射并打印为 `PublicKey`，按终端输出填写即可。
 
-### 🧭 分流规则（ACL4SSR，和机场一样导入订阅）
+### 🧭 分流规则（ACL4SSR，本机订阅）
 
 机场能自动出「直连 / 苹果 / 漏网之鱼」，是因为订阅内容本身就是 Clash 配置 + ACL4SSR 规则。
 `vless://` 只有节点，所以用 v2rayN 导入分享链接**不会**出现那些分组。
 
-安装结束后，终端和 `/etc/xray/client-link.txt` 会给出 **Clash 订阅链接**（走 ACL4SSR_Online 转换）。
+安装脚本会在 **你自己的 VPS** 上生成 Clash 配置，并用带随机口令的 HTTP 地址提供订阅，例如：
 
-1. 打开你平时导入机场的 **Clash Verge / mihomo**
-2. 新建订阅，把那条 `https://api.v1.mk/sub?...` 整段贴进去
+`http://<公网IP>:8787/<随机口令>/clash.yaml`
+
+**不会**把节点发到 `api.v1.mk` 之类的第三方转换站。
+
+1. 打开 Clash Verge / mihomo
+2. 新建订阅，把终端打印的 `http://.../clash.yaml` 贴进去
 3. 点更新；模式保持 **Rule / 规则**，不要开全局
-
-这样就会自动出现直连、苹果、国外媒体、漏网之鱼等分组，不用从 VPS 拷 yaml。
+4. 云安全组和 LXC/LXD 映射放行 **TCP 8787**（和 Reality 端口一样，要单独放行）
 
 | 客户端 | 怎么用 |
 |--------|--------|
-| Clash Verge / mihomo | **只贴 Clash 订阅链接**（推荐，和机场相同） |
+| Clash Verge / mihomo | 贴本机订阅链接（推荐） |
 | v2rayN | 只能导入 `vless://` 当节点，没有这些策略组；路由请选「绕过大陆」 |
-| 订阅打不开时 | 备用 `https://sub.xeton.dev/sub?...`，或本地 `/etc/xray/clash-meta.yaml` |
+| 订阅打不开 | 检查 8787 端口映射；或 `scp` 拉取 `/etc/xray/clash-meta.yaml` 本地导入 |
 
 规则模板：[ACL4SSR_Online.ini](https://github.com/ACL4SSR/ACL4SSR/blob/master/Clash/config/ACL4SSR_Online.ini)
 
@@ -466,10 +469,10 @@ A: 容器权限常见限制，脚本会降级继续；一般不导致 -1ms。
 ## 📜 更新日志
 
 ### v3.5（2026-09-17）— ACL4SSR 客户端分流
-- 安装后打印 Clash 订阅链接：粘贴到 Clash Verge 即自动生成 ACL4SSR 分组（和机场一样）
+- 在 VPS 本机生成 Clash 订阅（随机口令 HTTP 路径），导入 Clash Verge 即出 ACL4SSR 分组
+- **不使用**第三方订阅转换站，节点信息不会离开你的机器
 - 规则模板为 [ACL4SSR_Online](https://github.com/ACL4SSR/ACL4SSR/blob/master/Clash/config/ACL4SSR_Online.ini)
 - 同时生成本地备份 `/etc/xray/clash-meta.yaml` 与 `/etc/xray/xray-client.json`
-- 国内直连、广告拦截、GFW/Telegram/OpenAI 走代理，不再需要全局模式
 
 ### v3.4.8（2026-07-29）— 取消 SOCKS 密码长度强制限制
 - 去掉密码必须 8-128 位的校验，兼容 Telegram 等短密码场景

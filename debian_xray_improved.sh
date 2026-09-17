@@ -44,7 +44,8 @@ CLASH_FILE="/etc/xray/clash-meta.yaml"
 XRAY_CLIENT_FILE="/etc/xray/xray-client.json"
 CLIENT_NODE_NAME="Debian-Reality"
 CLASH_SUB_URL=""
-CLASH_SUB_URL_BACKUP=""
+CLASH_SUB_PORT="8787"
+CLASH_SUB_TOKEN=""
 
 # SNI 候选列表（多地域：美国/欧洲/印度/俄罗斯/亚太）
 # REALITY: 安装期强制校验 DNS/TCP443/HTTPS/TLS1.3，失败则中止
@@ -212,20 +213,6 @@ urlencode() {
     fi
     printf %s "$1" | sed 's/+/%2B/g; s/\//%2F/g; s/=/%3D/g'
 }
-
-urlencode_all() {
-    # 订阅链接要把整个 vless:// 做百分号编码
-    if command -v python3 >/dev/null 2>&1; then
-        printf %s "$1" | python3 -c 'import sys,urllib.parse; sys.stdout.write(urllib.parse.quote(sys.stdin.read(), safe=""))'
-        return 0
-    fi
-    if command -v jq >/dev/null 2>&1; then
-        jq -rn --arg s "$1" '$s|@uri'
-        return 0
-    fi
-    printf %s "$1" | sed 's/+/%2B/g; s/\//%2F/g; s/=/%3D/g; s/:/%3A/g; s/?/%3F/g; s/&/%26/g; s/#/%23/g'
-}
-
 
 
 
@@ -447,6 +434,102 @@ json_escape() {
 CLASH_FILE="${CLASH_FILE:-/etc/xray/clash-meta.yaml}"
 XRAY_CLIENT_FILE="${XRAY_CLIENT_FILE:-/etc/xray/xray-client.json}"
 CLIENT_NODE_NAME="${CLIENT_NODE_NAME:-Reality}"
+
+write_clash_sub_httpd() {
+    cat > /usr/local/bin/xray-clash-sub.py << 'PY'
+#!/usr/bin/env python3
+import os
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+def load_env(path="/etc/xray/clash-sub.env"):
+    env = {}
+    if not os.path.isfile(path):
+        sys.stderr.write("missing %s\n" % path)
+        sys.exit(1)
+    with open(path, "r") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            env[key.strip()] = val.strip().strip('"').strip("'")
+    return env
+
+cfg = load_env()
+PORT = int(cfg.get("CLASH_SUB_PORT", "8787"))
+TOKEN = cfg.get("CLASH_SUB_TOKEN", "")
+FILE = cfg.get("CLASH_SUB_FILE", "/etc/xray/clash-meta.yaml")
+if not TOKEN:
+    sys.exit("empty CLASH_SUB_TOKEN")
+REQ_PATH = "/" + TOKEN + "/clash.yaml"
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        return
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path != REQ_PATH:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        try:
+            with open(FILE, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/yaml; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+if __name__ == "__main__":
+    HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+PY
+    chmod 755 /usr/local/bin/xray-clash-sub.py 2>/dev/null || true
+}
+
+
+start_clash_sub_service() {
+    write_clash_sub_httpd
+    open_firewall_port "$CLASH_SUB_PORT"
+    pybin=$(command -v python3 || echo /usr/bin/python3)
+    cat > /etc/systemd/system/xray-clash-sub.service << SYSTEMD
+[Unit]
+Description=Xray local Clash subscription (ACL4SSR yaml)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${pybin} /usr/local/bin/xray-clash-sub.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMD
+    chmod 644 /etc/systemd/system/xray-clash-sub.service
+    systemctl daemon-reload
+    systemctl enable xray-clash-sub.service >/dev/null 2>&1 || true
+    systemctl restart xray-clash-sub.service
+    sleep 1
+    if systemctl is-active --quiet xray-clash-sub.service; then
+        echo "✅ Clash 本机订阅服务已启动 (TCP $CLASH_SUB_PORT)"
+    else
+        echo "⚠️  Clash 本机订阅服务启动失败，仍可用 $CLASH_FILE 本地导入"
+        systemctl status xray-clash-sub.service --no-pager -l | tail -n 20 || true
+    fi
+}
 
 write_client_routing_files() {
     node_name="${CLIENT_NODE_NAME:-Reality}"
@@ -830,42 +913,46 @@ YAML
 JSON
 
 
-    CLASH_SUB_URL=""
-    CLASH_SUB_URL_BACKUP=""
-    if [ -n "${SHARE_LINK:-}" ]; then
-        _vless_enc=$(urlencode_all "$SHARE_LINK") || _vless_enc=""
-        _cfg="https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/config/ACL4SSR_Online.ini"
-        _cfg_enc=$(urlencode_all "$_cfg") || _cfg_enc=""
-        if [ -n "$_vless_enc" ] && [ -n "$_cfg_enc" ]; then
-            _qs="target=clash&insert=false&emoji=true&list=false&udp=true&scv=true&fdn=false&sort=false&new_name=true&filename=${node_name}&url=${_vless_enc}&config=${_cfg_enc}"
-            CLASH_SUB_URL="https://api.v1.mk/sub?${_qs}"
-            CLASH_SUB_URL_BACKUP="https://sub.xeton.dev/sub?${_qs}"
-        fi
+
+    CLASH_SUB_PORT="${CLASH_SUB_PORT:-8787}"
+    if [ -z "${CLASH_SUB_TOKEN:-}" ]; then
+        CLASH_SUB_TOKEN=$(openssl rand -hex 16 2>/dev/null || true)
     fi
+    if [ -z "$CLASH_SUB_TOKEN" ] && [ -r /proc/sys/kernel/random/uuid ]; then
+        CLASH_SUB_TOKEN=$(tr -d '-' </proc/sys/kernel/random/uuid)
+    fi
+    if [ -z "$CLASH_SUB_TOKEN" ]; then
+        CLASH_SUB_TOKEN=$(date +%s | md5sum 2>/dev/null | awk '{print $1}')
+    fi
+    cat > /etc/xray/clash-sub.env << ENV
+CLASH_SUB_PORT=$CLASH_SUB_PORT
+CLASH_SUB_TOKEN=$CLASH_SUB_TOKEN
+CLASH_SUB_FILE=$CLASH_FILE
+ENV
+    chmod 600 /etc/xray/clash-sub.env 2>/dev/null || true
+    CLASH_SUB_URL="http://${client_addr}:${CLASH_SUB_PORT}/${CLASH_SUB_TOKEN}/clash.yaml"
+
 
     if [ -f "$SHARE_FILE" ]; then
         cat >> "$SHARE_FILE" << NOTE
 
-Clash 订阅（和机场一样粘贴即可，自动生成直连/苹果/漏网之鱼等分组）:
+Clash 订阅（本机提供，不经过任何第三方转换站）:
 $CLASH_SUB_URL
 
-备用订阅:
-$CLASH_SUB_URL_BACKUP
-
 用法: Clash Verge / mihomo → 新建订阅 → 粘贴上面链接 → 更新
-      模式选「规则」，不要开全局。这不是 vless:// 单节点链接。
+      模式选「规则」，不要开全局
+      安全组 / LXC 映射需放行 TCP $CLASH_SUB_PORT
+      链接含随机口令，不要发给别人
 
-本地备份配置:
+本地配置:
   Clash Meta: $CLASH_FILE
   Xray / NekoBox: $XRAY_CLIENT_FILE
   规则来源: https://github.com/ACL4SSR/ACL4SSR
 NOTE
     fi
 
-    echo "✅ 已生成 Clash 订阅（导入后自动出 ACL4SSR 分组）"
-    if [ -n "$CLASH_SUB_URL" ]; then
-        echo "  $CLASH_SUB_URL"
-    fi
+    echo "✅ 已生成本机 Clash 订阅（不经过第三方）"
+    echo "  $CLASH_SUB_URL"
     echo "  本地备份: $CLASH_FILE"
     if [ "$client_addr" = "YOUR_PUBLIC_IP" ]; then
         echo "⚠️  未检测到公网 IP，请把配置里的 YOUR_PUBLIC_IP 改成宿主机公网 IP"
@@ -1558,6 +1645,7 @@ $SHARE_LINK
 LINKEOF
 
 write_client_routing_files
+start_clash_sub_service
 
 cat << EOF
 -------------------------------------------------------
@@ -1581,16 +1669,14 @@ $SHARE_LINK
 
 参数已保存: $SHARE_FILE
 -------------------------------------------------------
-🧭 Clash 订阅（和机场一样，粘贴后自动出直连/苹果/漏网之鱼等分组）:
+🧭 Clash 订阅（本机提供，不经过第三方转换站）:
 $CLASH_SUB_URL
 
-备用:
-$CLASH_SUB_URL_BACKUP
-
-  用法: 打开 Clash Verge / mihomo → 导入订阅 → 粘贴上面整段链接 → 更新
+  用法: Clash Verge / mihomo → 新建订阅 → 粘贴上面链接 → 更新
         模式保持「规则」，不要开全局
-        不要把这条当 vless:// 用 v2rayN 导入
-  规则: ACL4SSR_Online  https://github.com/ACL4SSR/ACL4SSR
+        云安全组 / 宿主机映射请放行 TCP $CLASH_SUB_PORT
+        链接带随机口令，不要发给别人、不要发到公开处
+  规则: ACL4SSR_Online（配置在你自己的 VPS 上生成）
   本地备份: $CLASH_FILE
 -------------------------------------------------------
 🚨 客户端延迟一直是 -1ms 时，按这个顺序查（90% 是前 3 项）:
