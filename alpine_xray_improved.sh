@@ -76,7 +76,7 @@ CLASH_FILE="/etc/xray/clash-meta.yaml"
 XRAY_CLIENT_FILE="/etc/xray/xray-client.json"
 CLIENT_NODE_NAME="Alpine-Reality"
 CLASH_SUB_URL=""
-CLASH_SUB_PORT="8787"
+CLASH_SUB_PORT="${CLASH_SUB_PORT:-}"
 CLASH_SUB_TOKEN=""
 
 # 错误处理函数
@@ -454,7 +454,7 @@ def load_env(path="/etc/xray/clash-sub.env"):
     return env
 
 cfg = load_env()
-PORT = int(cfg.get("CLASH_SUB_PORT", "8787"))
+PORT = int(cfg.get("CLASH_SUB_PORT", "41237"))
 TOKEN = cfg.get("CLASH_SUB_TOKEN", "")
 FILE = cfg.get("CLASH_SUB_FILE", "/etc/xray/clash-meta.yaml")
 if not TOKEN:
@@ -906,7 +906,20 @@ JSON
 
 
 
-    CLASH_SUB_PORT="${CLASH_SUB_PORT:-8787}"
+    if ! echo "${CLASH_SUB_PORT:-}" | grep -Eq '^[0-9]+$' || [ "$CLASH_SUB_PORT" -lt 1024 ] || [ "$CLASH_SUB_PORT" -gt 65535 ]; then
+        CLASH_SUB_PORT=""
+        i=0
+        while [ "$i" -lt 20 ]; do
+            p=$(awk 'BEGIN{srand(); print int(rand()*25000)+40000}')
+            if [ "$p" = "$PORT" ] || [ "$p" = "${SOCKS_PORT:-}" ]; then
+                i=$((i+1))
+                continue
+            fi
+            CLASH_SUB_PORT=$p
+            break
+        done
+        [ -n "$CLASH_SUB_PORT" ] || CLASH_SUB_PORT=41237
+    fi
     if [ -z "${CLASH_SUB_TOKEN:-}" ]; then
         CLASH_SUB_TOKEN=$(openssl rand -hex 16 2>/dev/null || true)
     fi

@@ -193,20 +193,26 @@ Hash32:     <不是客户端公钥，不要填>
 
 安装脚本会在 **你自己的 VPS** 上生成 Clash 配置，并用带随机口令的 HTTP 地址提供订阅，例如：
 
-`http://<公网IP>:8787/<随机口令>/clash.yaml`
+`http://<公网IP>:<随机高位端口>/<随机口令>/clash.yaml`
 
 **不会**把节点发到 `api.v1.mk` 之类的第三方转换站。
 
 1. 打开 Clash Verge / mihomo
 2. 新建订阅，把终端打印的 `http://.../clash.yaml` 贴进去
 3. 点更新；模式保持 **Rule / 规则**，不要开全局
-4. 云安全组和 LXC/LXD 映射放行 **TCP 8787**（和 Reality 端口一样，要单独放行）
+4. 云安全组和 LXC/LXD 映射放行终端里打印的 **订阅端口**（默认在 40000–64999 随机，避免 8787 这类常见口被扫）
 
 | 客户端 | 怎么用 |
 |--------|--------|
 | Clash Verge / mihomo | 贴本机订阅链接（推荐） |
 | v2rayN | 只能导入 `vless://` 当节点，没有这些策略组；路由请选「绕过大陆」 |
-| 订阅打不开 | 检查 8787 端口映射；或 `scp` 拉取 `/etc/xray/clash-meta.yaml` 本地导入 |
+| 订阅打不开 | 检查终端里那个高位端口的映射；或 `scp` 拉取 `/etc/xray/clash-meta.yaml` 本地导入 |
+
+想固定订阅端口（可选）：
+
+```bash
+export CLASH_SUB_PORT=51234
+```
 
 规则模板：[ACL4SSR_Online.ini](https://github.com/ACL4SSR/ACL4SSR/blob/master/Clash/config/ACL4SSR_Online.ini)
 
