@@ -56,7 +56,7 @@ proxies:
     client-fingerprint: chrome
     reality-opts:
       public-key: YOUR_PUBLIC_KEY
-      short-id: 0123456789abcdef
+      short-id: "0123456789abcdef"
 
 proxy-groups:
   - name: 🚀 节点选择
@@ -67,7 +67,7 @@ proxy-groups:
       - DIRECT
   - name: ♻️ 自动选择
     type: url-test
-    url: http://www.gstatic.com/generate_204
+    url: https://www.gstatic.com/generate_204
     interval: 300
     tolerance: 50
     proxies:
@@ -130,90 +130,105 @@ rule-providers:
   LocalAreaNetwork:
     type: http
     behavior: classical
+    format: text
     url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/LocalAreaNetwork.list"
     path: ./ruleset/LocalAreaNetwork.yaml
     interval: 86400
   UnBan:
     type: http
     behavior: classical
+    format: text
     url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/UnBan.list"
     path: ./ruleset/UnBan.yaml
     interval: 86400
   BanAD:
     type: http
     behavior: classical
+    format: text
     url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/BanAD.list"
     path: ./ruleset/BanAD.yaml
     interval: 86400
   BanProgramAD:
     type: http
     behavior: classical
+    format: text
     url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/BanProgramAD.list"
     path: ./ruleset/BanProgramAD.yaml
     interval: 86400
   GoogleCN:
     type: http
     behavior: classical
+    format: text
     url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/GoogleCN.list"
     path: ./ruleset/GoogleCN.yaml
     interval: 86400
   SteamCN:
     type: http
     behavior: classical
+    format: text
     url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Ruleset/SteamCN.list"
     path: ./ruleset/SteamCN.yaml
     interval: 86400
   Microsoft:
     type: http
     behavior: classical
+    format: text
     url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Microsoft.list"
     path: ./ruleset/Microsoft.yaml
     interval: 86400
   Apple:
     type: http
     behavior: classical
+    format: text
     url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Apple.list"
     path: ./ruleset/Apple.yaml
     interval: 86400
   Telegram:
     type: http
     behavior: classical
+    format: text
     url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Telegram.list"
     path: ./ruleset/Telegram.yaml
     interval: 86400
   OpenAi:
     type: http
     behavior: classical
+    format: text
     url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Ruleset/OpenAi.list"
     path: ./ruleset/OpenAi.yaml
     interval: 86400
   ProxyMedia:
     type: http
     behavior: classical
+    format: text
     url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/ProxyMedia.list"
     path: ./ruleset/ProxyMedia.yaml
     interval: 86400
   ProxyGFWlist:
     type: http
     behavior: classical
+    format: text
     url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/ProxyGFWlist.list"
     path: ./ruleset/ProxyGFWlist.yaml
     interval: 86400
   ChinaMedia:
     type: http
     behavior: classical
+    format: text
     url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/ChinaMedia.list"
     path: ./ruleset/ChinaMedia.yaml
     interval: 86400
   ChinaDomain:
     type: http
     behavior: classical
+    format: text
     url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/ChinaDomain.list"
     path: ./ruleset/ChinaDomain.yaml
     interval: 86400
   ChinaCompanyIp:
     type: http
     behavior: classical
+    format: text
     url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/ChinaCompanyIp.list"
     path: ./ruleset/ChinaCompanyIp.yaml
     interval: 86400

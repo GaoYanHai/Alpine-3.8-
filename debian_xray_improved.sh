@@ -23,7 +23,10 @@ set -u  # 未定义变量时报错
 
 # 0. 自定义基础变量
 PORT=52300
-CLASH_SUB_PORT=58472   # Clash 订阅 HTTP 端口，改这一行即可
+CLASH_SUB_PORT="${CLASH_SUB_PORT:-58472}"   # Clash / v2rayN 订阅端口
+CLASH_SUB_HOST="${CLASH_SUB_HOST:-}"       # 可选：订阅域名，不改变 Reality 节点地址
+CLASH_SUB_TLS_CERT="${CLASH_SUB_TLS_CERT:-}" # 可选：PEM 完整证书链
+CLASH_SUB_TLS_KEY="${CLASH_SUB_TLS_KEY:-}"   # 可选：PEM 私钥路径
 ENABLE_SOCKS="${ENABLE_SOCKS:-0}"
 SOCKS_PORT="${SOCKS_PORT:-10808}"
 SOCKS_USER="${SOCKS_USER:-}"
@@ -45,6 +48,8 @@ CLASH_FILE="/etc/xray/clash-meta.yaml"
 XRAY_CLIENT_FILE="/etc/xray/xray-client.json"
 CLIENT_NODE_NAME="Debian-Reality"
 CLASH_SUB_URL=""
+V2RAYN_SUB_URL=""
+V2RAYN_SUB_FILE="/etc/xray/v2rayn.txt"
 CLASH_SUB_TOKEN=""
 
 # SNI 候选列表（多地域：美国/欧洲/印度/俄罗斯/亚太）
@@ -439,6 +444,7 @@ write_clash_sub_httpd() {
     cat > /usr/local/bin/xray-clash-sub.py << 'PY'
 #!/usr/bin/env python3
 import os
+import ssl
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -460,9 +466,16 @@ cfg = load_env()
 PORT = int(cfg.get("CLASH_SUB_PORT", "58472"))
 TOKEN = cfg.get("CLASH_SUB_TOKEN", "")
 FILE = cfg.get("CLASH_SUB_FILE", "/etc/xray/clash-meta.yaml")
+V2RAYN_FILE = cfg.get("V2RAYN_SUB_FILE", "/etc/xray/v2rayn.txt")
+TLS_CERT = cfg.get("CLASH_SUB_TLS_CERT", "")
+TLS_KEY = cfg.get("CLASH_SUB_TLS_KEY", "")
 if not TOKEN:
     sys.exit("empty CLASH_SUB_TOKEN")
 REQ_PATH = "/" + TOKEN + "/clash.yaml"
+ROUTES = {
+    REQ_PATH: (FILE, "text/yaml; charset=utf-8"),
+    "/" + TOKEN + "/vless.txt": (V2RAYN_FILE, "text/plain; charset=utf-8"),
+}
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -470,13 +483,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
-        if path != REQ_PATH:
+        route = ROUTES.get(path)
+        if route is None:
             self.send_response(404)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
         try:
-            with open(FILE, "rb") as fh:
+            with open(route[0], "rb") as fh:
                 data = fh.read()
         except OSError:
             self.send_response(404)
@@ -484,14 +498,22 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         self.send_response(200)
-        self.send_header("Content-Type", "text/yaml; charset=utf-8")
+        self.send_header("Content-Type", route[1])
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
 
 if __name__ == "__main__":
-    HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    if TLS_CERT or TLS_KEY:
+        if not TLS_CERT or not TLS_KEY:
+            sys.exit("both CLASH_SUB_TLS_CERT and CLASH_SUB_TLS_KEY are required")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(TLS_CERT, TLS_KEY)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+    server.serve_forever()
 PY
     chmod 755 /usr/local/bin/xray-clash-sub.py 2>/dev/null || true
 }
@@ -596,7 +618,7 @@ proxies:
     client-fingerprint: chrome
     reality-opts:
       public-key: ${PUB_KEY}
-      short-id: ${SHORT_ID}
+      short-id: "${SHORT_ID}"
 
 proxy-groups:
   - name: 🚀 节点选择
@@ -607,7 +629,7 @@ proxy-groups:
       - DIRECT
   - name: ♻️ 自动选择
     type: url-test
-    url: http://www.gstatic.com/generate_204
+    url: https://www.gstatic.com/generate_204
     interval: 300
     tolerance: 50
     proxies:
@@ -670,90 +692,105 @@ rule-providers:
   LocalAreaNetwork:
     type: http
     behavior: classical
+    format: text
     url: "${acl_cdn}/LocalAreaNetwork.list"
     path: ./ruleset/LocalAreaNetwork.yaml
     interval: 86400
   UnBan:
     type: http
     behavior: classical
+    format: text
     url: "${acl_cdn}/UnBan.list"
     path: ./ruleset/UnBan.yaml
     interval: 86400
   BanAD:
     type: http
     behavior: classical
+    format: text
     url: "${acl_cdn}/BanAD.list"
     path: ./ruleset/BanAD.yaml
     interval: 86400
   BanProgramAD:
     type: http
     behavior: classical
+    format: text
     url: "${acl_cdn}/BanProgramAD.list"
     path: ./ruleset/BanProgramAD.yaml
     interval: 86400
   GoogleCN:
     type: http
     behavior: classical
+    format: text
     url: "${acl_cdn}/GoogleCN.list"
     path: ./ruleset/GoogleCN.yaml
     interval: 86400
   SteamCN:
     type: http
     behavior: classical
+    format: text
     url: "${acl_cdn}/Ruleset/SteamCN.list"
     path: ./ruleset/SteamCN.yaml
     interval: 86400
   Microsoft:
     type: http
     behavior: classical
+    format: text
     url: "${acl_cdn}/Microsoft.list"
     path: ./ruleset/Microsoft.yaml
     interval: 86400
   Apple:
     type: http
     behavior: classical
+    format: text
     url: "${acl_cdn}/Apple.list"
     path: ./ruleset/Apple.yaml
     interval: 86400
   Telegram:
     type: http
     behavior: classical
+    format: text
     url: "${acl_cdn}/Telegram.list"
     path: ./ruleset/Telegram.yaml
     interval: 86400
   OpenAi:
     type: http
     behavior: classical
+    format: text
     url: "${acl_cdn}/Ruleset/OpenAi.list"
     path: ./ruleset/OpenAi.yaml
     interval: 86400
   ProxyMedia:
     type: http
     behavior: classical
+    format: text
     url: "${acl_cdn}/ProxyMedia.list"
     path: ./ruleset/ProxyMedia.yaml
     interval: 86400
   ProxyGFWlist:
     type: http
     behavior: classical
+    format: text
     url: "${acl_cdn}/ProxyGFWlist.list"
     path: ./ruleset/ProxyGFWlist.yaml
     interval: 86400
   ChinaMedia:
     type: http
     behavior: classical
+    format: text
     url: "${acl_cdn}/ChinaMedia.list"
     path: ./ruleset/ChinaMedia.yaml
     interval: 86400
   ChinaDomain:
     type: http
     behavior: classical
+    format: text
     url: "${acl_cdn}/ChinaDomain.list"
     path: ./ruleset/ChinaDomain.yaml
     interval: 86400
   ChinaCompanyIp:
     type: http
     behavior: classical
+    format: text
     url: "${acl_cdn}/ChinaCompanyIp.list"
     path: ./ruleset/ChinaCompanyIp.yaml
     interval: 86400
@@ -914,6 +951,19 @@ JSON
 
 
 
+    # 原生节点订阅供 v2rayN 使用，避免完整 Clash YAML 切换到 mihomo。
+    printf '%s\n' "$SHARE_LINK" | base64 | tr -d '\r\n' > "$V2RAYN_SUB_FILE"
+    printf '\n' >> "$V2RAYN_SUB_FILE"
+    chmod 600 "$V2RAYN_SUB_FILE" 2>/dev/null || true
+    sub_scheme=http
+    sub_host="${CLASH_SUB_HOST:-$client_addr}"
+    if [ -n "$CLASH_SUB_TLS_CERT" ] || [ -n "$CLASH_SUB_TLS_KEY" ]; then
+        [ -n "$CLASH_SUB_TLS_CERT" ] && [ -n "$CLASH_SUB_TLS_KEY" ] || error_exit "HTTPS 订阅必须同时设置证书和私钥路径"
+        [ -r "$CLASH_SUB_TLS_CERT" ] && [ -r "$CLASH_SUB_TLS_KEY" ] || error_exit "HTTPS 订阅证书或私钥文件不可读"
+        [ -n "$CLASH_SUB_HOST" ] || error_exit "HTTPS 订阅请设置证书对应的 CLASH_SUB_HOST 域名"
+        sub_scheme=https
+    fi
+
     if [ -z "${CLASH_SUB_TOKEN:-}" ]; then
         CLASH_SUB_TOKEN=$(openssl rand -hex 16 2>/dev/null || true)
     fi
@@ -925,11 +975,16 @@ JSON
     fi
     cat > /etc/xray/clash-sub.env << ENV
 CLASH_SUB_PORT=$CLASH_SUB_PORT
+CLASH_SUB_HOST=$CLASH_SUB_HOST
 CLASH_SUB_TOKEN=$CLASH_SUB_TOKEN
 CLASH_SUB_FILE=$CLASH_FILE
+V2RAYN_SUB_FILE=$V2RAYN_SUB_FILE
+CLASH_SUB_TLS_CERT=$CLASH_SUB_TLS_CERT
+CLASH_SUB_TLS_KEY=$CLASH_SUB_TLS_KEY
 ENV
     chmod 600 /etc/xray/clash-sub.env 2>/dev/null || true
-    CLASH_SUB_URL="http://${client_addr}:${CLASH_SUB_PORT}/${CLASH_SUB_TOKEN}/clash.yaml"
+    CLASH_SUB_URL="${sub_scheme}://${sub_host}:${CLASH_SUB_PORT}/${CLASH_SUB_TOKEN}/clash.yaml"
+    V2RAYN_SUB_URL="${sub_scheme}://${sub_host}:${CLASH_SUB_PORT}/${CLASH_SUB_TOKEN}/vless.txt"
 
 
     if [ -f "$SHARE_FILE" ]; then
@@ -937,6 +992,9 @@ ENV
 
 Clash 订阅（本机提供，不经过任何第三方转换站）:
 $CLASH_SUB_URL
+
+v2rayN 原生 VLESS 订阅（使用 Xray，路由选「绕过大陆」）:
+$V2RAYN_SUB_URL
 
 用法: Clash Verge / mihomo → 新建订阅 → 粘贴上面链接 → 更新
       模式选「规则」，不要开全局
@@ -952,6 +1010,7 @@ NOTE
 
     echo "✅ 已生成本机 Clash 订阅（不经过第三方）"
     echo "  $CLASH_SUB_URL"
+    echo "  v2rayN 原生订阅: $V2RAYN_SUB_URL"
     echo "  本地备份: $CLASH_FILE"
     if [ "$client_addr" = "YOUR_PUBLIC_IP" ]; then
         echo "⚠️  未检测到公网 IP，请把配置里的 YOUR_PUBLIC_IP 改成宿主机公网 IP"
@@ -1670,6 +1729,9 @@ $SHARE_LINK
 -------------------------------------------------------
 🧭 Clash 订阅（本机提供，不经过第三方转换站）:
 $CLASH_SUB_URL
+
+v2rayN 原生 VLESS 订阅（推荐 v2rayN 使用，节点内核选 Xray）:
+$V2RAYN_SUB_URL
 
   用法: Clash Verge / mihomo → 新建订阅 → 粘贴上面链接 → 更新
         模式保持「规则」，不要开全局

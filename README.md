@@ -195,6 +195,8 @@ Hash32:     <不是客户端公钥，不要填>
 
 `http://<公网IP>:58472/<随机口令>/clash.yaml`
 
+默认地址使用明文 HTTP，客户端提示「HTTP 不安全」是正常的；随机口令不提供传输加密。脚本支持通过 `CLASH_SUB_HOST`、`CLASH_SUB_TLS_CERT`、`CLASH_SUB_TLS_KEY` 设置域名、PEM 完整证书链和私钥路径，直接在订阅端口启用 HTTPS，也可用现有网站反向代理。仅把 `http` 改成 `https` 无法启用 TLS。也可以通过 SSH/SCP 下载配置后在客户端本地导入。
+
 **不会**把节点发到 `api.v1.mk` 之类的第三方转换站。
 
 1. 打开 Clash Verge / mihomo
@@ -205,10 +207,49 @@ Hash32:     <不是客户端公钥，不要填>
 | 客户端 | 怎么用 |
 |--------|--------|
 | Clash Verge / mihomo | 贴本机订阅链接（推荐） |
-| v2rayN | 只能导入 `vless://` 当节点，没有这些策略组；路由请选「绕过大陆」 |
+| v2rayN | 推荐使用安装输出的 `vless.txt` 原生订阅，节点内核选 Xray，路由选「绕过大陆」 |
 | 订阅打不开 | 检查终端里那个高位端口的映射；或 `scp` 拉取 `/etc/xray/clash-meta.yaml` 本地导入 |
 
-订阅端口写在脚本最上面的 `CLASH_SUB_PORT=58472`，改这一行即可。
+订阅端口默认 58472，可以通过 `CLASH_SUB_PORT` 环境变量覆盖。
+
+v2rayN 7.16.9 会把完整 Clash YAML 作为 **mihomo 自定义配置** 导入，和普通 VLESS 节点使用不同的内核处理路径。若 VLESS 可用但 Clash 订阅节点测速超时，可新建订阅分组，使用同一口令路径下的 `vless.txt`：
+
+`http://<公网IP>:58472/<随机口令>/vless.txt`
+
+它返回原分享链接的 Base64 订阅，保留全部 Reality 参数；v2rayN 使用 Xray，分流由 v2rayN 路由设置控制，不包含 Clash 策略组。两种订阅都由自己的 VPS 提供。
+
+已有安装遇到订阅异常时，无需重装 Xray：先修改服务器上的 `/etc/xray/clash-meta.yaml`，再在客户端更新订阅。ACL4SSR 的 `.list` 是纯文本，每个 `rule-providers` 项需要在 `behavior: classical` 同级设置 `format: text`；否则可能语法检查通过却加载 0 条规则。自动选择组的测速地址使用 `https://www.gstatic.com/generate_204`，Reality 的 `short-id` 应加引号，避免纯数字值或前导零被 YAML 转换。只点「更新订阅」不会修复服务器上原有的文件。
+
+如果同一节点的 VLESS 链接可用，但 Clash 仍然超时，请对比订阅中的 `server`、`port`、`uuid`、`flow`、`servername`、`client-fingerprint` 和 `reality-opts`，并检查客户端日志。规则加载失败、测速目标不可达和 Reality 握手失败是不同的问题，不能仅凭 HTTP 提示判断节点故障。
+
+#### 已安装 VPS 更新订阅（不重装 Xray）
+
+把最新版 `subscription-update.sh` 和对应系统的安装脚本放在同一目录，运行：
+
+```bash
+bash subscription-update.sh
+```
+
+工具复用 `/etc/xray/client-link.txt` 中与现有入站匹配的链接以及原订阅口令，备份后更新订阅文件、重启订阅服务，不改动 Xray 配置或重启 Xray。若单独下载工具，它会从本项目 main 获取安装脚本中的订阅函数。当前支持脚本默认的 IPv4、TCP、Vision、chrome 参数；修改过这些参数或入站/出站端口不一致时，请先校对分享链接。
+
+#### NAT VPS + Cloudflare 域名启用 HTTPS
+
+例如 `zor.zor.de5.net`：在 Cloudflare 为完整主机名 `zor.zor.de5.net` 添加 A 记录（名称相对于托管区域填写），指向 **NAT 宿主机的公网 IP**，设为 **仅 DNS（关闭小黄云）**。保留当前可用的订阅端口映射，例如宿主机 TCP 58472 → 容器 TCP 58472；TLS 可以运行在这个端口，不需要开放 443。外部端口与容器端口不同时，客户端 URL 使用外部端口。Reality 节点保持原公网 IP，不改为 Cloudflare 代理地址。
+
+通过 ACME DNS-01 验证申请 `zor.zor.de5.net` 的公开受信任证书，不需要入站 80/443。可以使用 acme.sh 的 `dns_cf` 插件，Cloudflare API Token 只在 VPS 本地配置，权限限定到对应域名的 DNS 编辑及必要的区域读取。**Cloudflare Origin CA 证书不能用于关闭小黄云后的直接访问。** 证书须覆盖完整域名；安装到稳定路径，勿直接使用 ACME 工具内部缓存。
+
+拿到完整证书链和私钥后，例如分别安装到 `/etc/xray/tls/fullchain.pem` 和 `/etc/xray/tls/key.pem`，运行：
+
+```bash
+CLASH_SUB_HOST=zor.zor.de5.net \
+CLASH_SUB_TLS_CERT=/etc/xray/tls/fullchain.pem \
+CLASH_SUB_TLS_KEY=/etc/xray/tls/key.pem \
+bash subscription-update.sh
+```
+
+保持原端口 58472 时，输出的 v2rayN 地址将是 `https://zor.zor.de5.net:58472/<原口令>/vless.txt`。同一端口切换为 TLS 后，旧 `http://` 地址需改为 `https://`。证书续期后需要重启订阅服务以重新加载证书：Debian 使用 `systemctl restart xray-clash-sub.service`，Alpine 使用 `sh /etc/local.d/clash-sub.start`，可配置为证书工具的续期钩子。证书文件需允许服务读取，私钥保持仅 root 可读。
+
+如以后改用 Cloudflare 代理，需使用它支持的 HTTPS 端口（例如 443 或 8443），SSL/TLS 设为 Full (strict)，并正确映射到启用 TLS 的订阅服务；58472 不在常规代理支持范围。
 
 规则模板：[ACL4SSR_Online.ini](https://github.com/ACL4SSR/ACL4SSR/blob/master/Clash/config/ACL4SSR_Online.ini)
 
