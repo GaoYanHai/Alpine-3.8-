@@ -22,6 +22,8 @@ set -u  # 未定义变量时报错
 # 0. 自定义基础变量
 PORT=52300
 CLASH_SUB_PORT="${CLASH_SUB_PORT:-58472}"   # Clash / v2rayN 订阅端口
+CLASH_SUB_HTTPS="${CLASH_SUB_HTTPS:-auto}" # auto/cloudflare/existing/off
+CLASH_SUB_PUBLIC_PORT="${CLASH_SUB_PUBLIC_PORT:-}" # NAT 外部端口，默认等于监听端口
 CLASH_SUB_HOST="${CLASH_SUB_HOST:-}"       # 可选：订阅域名，不改变 Reality 节点地址
 CLASH_SUB_TLS_CERT="${CLASH_SUB_TLS_CERT:-}" # 可选：PEM 完整证书链
 CLASH_SUB_TLS_KEY="${CLASH_SUB_TLS_KEY:-}"   # 可选：PEM 私钥路径
@@ -972,6 +974,7 @@ JSON
     fi
     cat > /etc/xray/clash-sub.env << ENV
 CLASH_SUB_PORT=$CLASH_SUB_PORT
+CLASH_SUB_PUBLIC_PORT=${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT}
 CLASH_SUB_HOST=$CLASH_SUB_HOST
 CLASH_SUB_TOKEN=$CLASH_SUB_TOKEN
 CLASH_SUB_FILE=$CLASH_FILE
@@ -980,8 +983,8 @@ CLASH_SUB_TLS_CERT=$CLASH_SUB_TLS_CERT
 CLASH_SUB_TLS_KEY=$CLASH_SUB_TLS_KEY
 ENV
     chmod 600 /etc/xray/clash-sub.env 2>/dev/null || true
-    CLASH_SUB_URL="${sub_scheme}://${sub_host}:${CLASH_SUB_PORT}/${CLASH_SUB_TOKEN}/clash.yaml"
-    V2RAYN_SUB_URL="${sub_scheme}://${sub_host}:${CLASH_SUB_PORT}/${CLASH_SUB_TOKEN}/vless.txt"
+    CLASH_SUB_URL="${sub_scheme}://${sub_host}:${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT}/${CLASH_SUB_TOKEN}/clash.yaml"
+    V2RAYN_SUB_URL="${sub_scheme}://${sub_host}:${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT}/${CLASH_SUB_TOKEN}/vless.txt"
 
 
     if [ -f "$SHARE_FILE" ]; then
@@ -1013,6 +1016,273 @@ NOTE
         echo "⚠️  未检测到公网 IP，请把配置里的 YOUR_PUBLIC_IP 改成宿主机公网 IP"
     fi
 }
+
+# BEGIN subscription HTTPS wizard (kept identical in both standalone installers)
+subscription_prompt() {
+    # Read the terminal rather than stdin, including curl | sh installations.
+    sub_reply=""
+    if [ -t 3 ] 2>/dev/null; then
+        printf '%s [%s]: ' "$1" "${2:-}" >&3
+        IFS= read -r sub_reply <&3 || return 1
+    else
+        return 1
+    fi
+    printf '%s' "${sub_reply:-${2:-}}"
+}
+
+subscription_validate_options() {
+    python3 - "$CLASH_SUB_HOST" "$CLASH_SUB_PORT" "$CLASH_SUB_PUBLIC_PORT" "${PORT:-52300}" <<'PY'
+import ipaddress
+import re
+import sys
+host, port, public_port, reality_port = sys.argv[1:]
+if host:
+    if len(host) > 253 or '.' not in host or any(not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label) for label in host.split('.')):
+        sys.exit('订阅域名无效：只填写完整域名，不带 https://、端口或路径。')
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        sys.exit('HTTPS 订阅请使用域名，而不是 IP。')
+for value in (port, public_port):
+    if not re.fullmatch(r'[0-9]{1,5}', value) or not 1 <= int(value) <= 65535:
+        sys.exit('订阅端口必须在 1–65535 之间。')
+if int(port) == int(reality_port):
+    sys.exit('订阅监听端口不能与 Reality 端口相同。')
+PY
+}
+
+subscription_validate_tls() {
+    [ -n "$CLASH_SUB_HOST" ] && [ -n "$CLASH_SUB_TLS_CERT" ] && [ -n "$CLASH_SUB_TLS_KEY" ] || return 1
+    python3 - "$CLASH_SUB_TLS_CERT" "$CLASH_SUB_TLS_KEY" <<'PY'
+import ssl
+import sys
+if any(c in path for path in sys.argv[1:] for c in '\r\n'):
+    sys.exit('证书路径不能含换行。')
+ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(*sys.argv[1:])
+PY
+    [ "$?" -eq 0 ] || return 1
+    openssl x509 -in "$CLASH_SUB_TLS_CERT" -noout -checkend 86400 || return 1
+    # Verify both hostname and public trust; reject Cloudflare Origin CA for grey-cloud access.
+    openssl verify -purpose sslserver -verify_hostname "$CLASH_SUB_HOST" \
+        -untrusted "$CLASH_SUB_TLS_CERT" "$CLASH_SUB_TLS_CERT" || return 1
+}
+
+subscription_install_acme() (
+    umask 077
+    if [ ! -f /root/.acme.sh/acme.sh ]; then
+        echo "正在从 acme.sh 官方仓库安装证书工具..."
+        sub_acme_tmp=$(mktemp -d) || exit 1
+        trap 'rm -rf -- "$sub_acme_tmp"' EXIT
+        trap 'exit 1' HUP INT TERM
+        curl -fSL --retry 2 --connect-timeout 15 --max-time 120 \
+            https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/heads/master \
+            -o "$sub_acme_tmp/acme.tar.gz" || exit 1
+        tar -xzf "$sub_acme_tmp/acme.tar.gz" -C "$sub_acme_tmp" || exit 1
+        (cd "$sub_acme_tmp/acme.sh-master" && sh ./acme.sh --install \
+            --home /root/.acme.sh --no-profile --no-cron) || exit 1
+    fi
+    chmod 700 /root/.acme.sh || exit 1
+)
+
+subscription_write_reload_hook() {
+    # Initial certificate installation may precede creation of the subscription service.
+    mkdir -p /usr/local/bin || return 1
+    cat > /usr/local/bin/xray-sub-cert-reload <<'HOOK'
+#!/bin/sh
+set -e
+if [ -f /etc/xray/clash-sub.env ] && grep -q '^CLASH_SUB_TLS_CERT=.' /etc/xray/clash-sub.env; then
+    if [ -f /etc/alpine-release ]; then
+        [ ! -f /etc/local.d/clash-sub.start ] || sh /etc/local.d/clash-sub.start
+    elif [ -f /etc/systemd/system/xray-clash-sub.service ]; then
+        systemctl restart xray-clash-sub.service
+    fi
+fi
+HOOK
+    chmod 700 /usr/local/bin/xray-sub-cert-reload
+}
+
+subscription_schedule_renewal() {
+    if [ -f /etc/alpine-release ]; then
+        cat > /etc/periodic/daily/xray-sub-renew <<'CRON'
+#!/bin/sh
+umask 077
+exec sh /root/.acme.sh/acme.sh --cron --home /root/.acme.sh >> /var/log/xray-sub-renew.log 2>&1
+CRON
+        chmod 700 /etc/periodic/daily/xray-sub-renew || return 1
+        rc-update add crond default || return 1
+        rc-service crond start || return 1
+    else
+        cat > /etc/systemd/system/xray-sub-renew.service <<'SERVICE'
+[Unit]
+Description=Renew Xray subscription HTTPS certificate
+Wants=network-online.target
+After=network-online.target
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/bin/sh /root/.acme.sh/acme.sh --cron --home /root/.acme.sh
+SERVICE
+        cat > /etc/systemd/system/xray-sub-renew.timer <<'TIMER'
+[Unit]
+Description=Daily check for Xray subscription certificate renewal
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=3600
+Persistent=true
+[Install]
+WantedBy=timers.target
+TIMER
+        systemctl daemon-reload || return 1
+        systemctl enable --now xray-sub-renew.timer || return 1
+    fi
+}
+
+subscription_setup_cloudflare() (
+    # Restrict newly created certificate / ACME account files, including the saved renewal token.
+    set +x
+    umask 077
+    echo "Cloudflare → 个人资料 → API 令牌 → 创建令牌 → 编辑区域 DNS。"
+    echo "权限：区域/DNS/编辑 + 区域/区域/读取；资源仅包含此域名所属区域。"
+    echo "Token 只在本机输入；acme.sh 会保存它供自动续期使用。"
+    if [ -z "${CF_Token:-}" ]; then
+        CF_Token=$(python3 - <<'PY'
+import getpass
+import sys
+try:
+    with open('/dev/tty', 'w') as tty:
+        if not tty.isatty():
+            sys.exit('无终端：请通过 CF_Token 环境变量提供 Cloudflare API Token。')
+        token = getpass.getpass('Cloudflare API Token（隐藏输入）: ', stream=tty)
+except OSError:
+    sys.exit('无终端：请通过 CF_Token 环境变量提供 Cloudflare API Token。')
+if not token or any(c.isspace() for c in token):
+    sys.exit('API Token 不能为空或含空白。')
+print(token, end='')
+PY
+        ) || exit 1
+    fi
+    export CF_Token
+    subscription_install_acme || exit 1
+    subscription_write_reload_hook || exit 1
+    echo "正在使用 Let's Encrypt DNS-01 签发证书（无需入站 80/443）..."
+    if sh /root/.acme.sh/acme.sh --issue --home /root/.acme.sh --dns dns_cf \
+        -d "$CLASH_SUB_HOST" --server letsencrypt --keylength ec-256; then
+        :
+    else
+        sub_issue_status=$?
+        # acme.sh returns 2 when the existing certificate is not due for renewal.
+        [ "$sub_issue_status" -eq 2 ] || exit "$sub_issue_status"
+    fi
+    mkdir -p /etc/xray/tls || exit 1
+    chmod 700 /etc/xray/tls || exit 1
+    sh /root/.acme.sh/acme.sh --install-cert --home /root/.acme.sh \
+        -d "$CLASH_SUB_HOST" --ecc \
+        --key-file "$CLASH_SUB_TLS_KEY" --fullchain-file "$CLASH_SUB_TLS_CERT" \
+        --reloadcmd /usr/local/bin/xray-sub-cert-reload || exit 1
+    chmod 600 "$CLASH_SUB_TLS_KEY" || exit 1
+    subscription_validate_tls || exit 1
+    subscription_schedule_renewal || exit 1
+    echo "✅ 已配置每日续期检查，证书更新后自动重启订阅服务。"
+)
+
+configure_subscription_https() {
+    CLASH_SUB_HTTPS="${CLASH_SUB_HTTPS:-auto}"
+    CLASH_SUB_HOST="${CLASH_SUB_HOST:-}"
+    CLASH_SUB_TLS_CERT="${CLASH_SUB_TLS_CERT:-}"
+    CLASH_SUB_TLS_KEY="${CLASH_SUB_TLS_KEY:-}"
+    CLASH_SUB_PUBLIC_PORT="${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT}"
+    sub_https_reuse=0
+    # This subshell check avoids a fatal /dev/tty redirection in noninteractive sh.
+    if ( : </dev/tty ) 2>/dev/null; then
+        exec 3<>/dev/tty
+    fi
+    if [ "$CLASH_SUB_HTTPS" = auto ]; then
+        if [ -n "$CLASH_SUB_TLS_CERT$CLASH_SUB_TLS_KEY" ]; then
+            CLASH_SUB_HTTPS=existing
+            sub_https_reuse=1
+        elif [ -n "$CLASH_SUB_HOST" ]; then
+            CLASH_SUB_HTTPS=cloudflare
+        elif [ -t 3 ] 2>/dev/null; then
+            echo "订阅访问方式：1) Cloudflare 自动申请 HTTPS（推荐） 2) 已有公开证书 3) HTTP"
+            sub_choice=$(subscription_prompt "请选择" 1) || error_exit "订阅向导已中断"
+            case "$sub_choice" in
+                1) CLASH_SUB_HTTPS=cloudflare ;;
+                2) CLASH_SUB_HTTPS=existing ;;
+                3) CLASH_SUB_HTTPS=off ;;
+                *) error_exit "无效选择，请重新运行并选择 1、2 或 3" ;;
+            esac
+        else
+            CLASH_SUB_HTTPS=off
+            echo "无交互终端且未指定 HTTPS 参数：保持 HTTP。稍后可运行 bash subscription-update.sh --https。"
+        fi
+    fi
+    case "$CLASH_SUB_HTTPS" in
+        off)
+            [ -z "$CLASH_SUB_TLS_CERT$CLASH_SUB_TLS_KEY" ] || error_exit "已有 TLS 配置，不能用 off 静默降级；请保留 HTTPS"
+            ;;
+        cloudflare|existing)
+            if [ -z "$CLASH_SUB_HOST" ]; then
+                CLASH_SUB_HOST=$(subscription_prompt "完整订阅域名，例如 zor.zor.de5.net" "") || error_exit "请设置 CLASH_SUB_HOST"
+            fi
+            if [ "$sub_https_reuse" -eq 0 ] && [ -t 3 ] 2>/dev/null; then
+                CLASH_SUB_PUBLIC_PORT=$(subscription_prompt "公网订阅端口（NAT 外部端口）" "$CLASH_SUB_PUBLIC_PORT") || error_exit "订阅向导已中断"
+            fi
+            subscription_validate_options || error_exit "请修正订阅域名或端口后重试"
+            echo "请在 Cloudflare DNS 添加 A 记录：$CLASH_SUB_HOST → ${CLEAR_IP:-NAT宿主机公网IP}，选择仅 DNS（灰云）。"
+            echo "NAT/安全组：公网 TCP $CLASH_SUB_PUBLIC_PORT → 容器 TCP $CLASH_SUB_PORT；不需要开放 80/443。"
+            echo "Cloudflare 边缘证书不能下载使用；Origin CA 不适用于灰云直连。"
+            if [ "$sub_https_reuse" -eq 0 ] && [ -t 3 ] 2>/dev/null; then
+                sub_ready=$(subscription_prompt "确认上述 DNS 和端口映射已设置后按回车，输入 q 退出" "继续") || error_exit "订阅向导已中断"
+                [ "$sub_ready" != q ] || error_exit "已退出；设置完成后可重新运行订阅更新工具"
+            fi
+            if [ "$CLASH_SUB_HTTPS" = cloudflare ]; then
+                CLASH_SUB_TLS_CERT=/etc/xray/tls/fullchain.pem
+                CLASH_SUB_TLS_KEY=/etc/xray/tls/key.pem
+                subscription_setup_cloudflare || error_exit "HTTPS 配置未完成，原订阅文件尚未改写。检查 Token 权限/网络后运行 bash subscription-update.sh --https 重试；不要反复重装 Xray。"
+            else
+                if [ -z "$CLASH_SUB_TLS_CERT" ]; then
+                    CLASH_SUB_TLS_CERT=$(subscription_prompt "完整证书链路径" /etc/xray/tls/fullchain.pem) || error_exit "请设置 CLASH_SUB_TLS_CERT"
+                fi
+                if [ -z "$CLASH_SUB_TLS_KEY" ]; then
+                    CLASH_SUB_TLS_KEY=$(subscription_prompt "私钥路径" /etc/xray/tls/key.pem) || error_exit "请设置 CLASH_SUB_TLS_KEY"
+                fi
+                subscription_validate_tls || error_exit "证书无效：请检查证书链、公私钥、域名和有效期；灰云直连不能使用 Origin CA"
+                echo "使用已有证书；请在原证书工具续期后重启订阅服务以加载证书。"
+            fi
+            ;;
+        *) error_exit "CLASH_SUB_HTTPS 仅支持 auto、cloudflare、existing、off" ;;
+    esac
+    subscription_validate_options || error_exit "订阅域名或端口无效"
+    exec 3>&-
+}
+subscription_verify_local() {
+    python3 - "$CLASH_SUB_HOST" "$CLASH_SUB_PORT" "$CLASH_SUB_TOKEN" "$CLASH_SUB_TLS_CERT" <<'PY'
+import http.client
+import socket
+import ssl
+import sys
+host, port, token, cert = sys.argv[1:]
+try:
+    stream = socket.create_connection(('127.0.0.1', int(port)), timeout=8)
+    if cert:
+        stream = ssl.create_default_context().wrap_socket(stream, server_hostname=host)
+    with stream:
+        stream.sendall(('GET /' + token + '/clash.yaml HTTP/1.1\r\nHost: ' + (host or 'localhost') + '\r\nConnection: close\r\n\r\n').encode())
+        response = http.client.HTTPResponse(stream)
+        response.begin()
+        if response.status != 200 or not response.read():
+            sys.exit('订阅本机自检失败：未返回有效配置，请检查订阅服务日志。')
+except (OSError, ssl.SSLError, http.client.HTTPException):
+    sys.exit('订阅本机自检失败：请检查监听端口、证书和订阅服务日志。')
+print('✅ 订阅本机自检通过' + ('（HTTPS 证书验证成功）' if cert else '（HTTP）'))
+PY
+    [ "$?" -eq 0 ] || error_exit "订阅服务未通过自检"
+    echo "请从客户端访问打印的订阅链接，确认公网 DNS、安全组和 NAT 映射；本机自检不代表公网可达。"
+}
+# END subscription HTTPS wizard
+
 
 is_truthy() {
     case "$(printf %s "$1" | tr "A-Z" "a-z")" in
@@ -1639,8 +1909,10 @@ $SOCKS_INFO_TEXT
 $SHARE_LINK
 LINKEOF
 
+configure_subscription_https
 write_client_routing_files
 start_clash_sub_service
+subscription_verify_local
 
 cat << EOF
 -------------------------------------------------------

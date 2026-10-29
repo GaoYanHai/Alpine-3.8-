@@ -87,6 +87,7 @@
 | ⚡ 下载重试 | Xray 二进制下载失败自动重试 3 次 |
 | ✅ 配置验证 | JSON / `xray run -test` / 关键字段校验 |
 | 🧭 ACL4SSR 分流 | 安装后生成 Clash Meta / Xray 客户端规则配置，国内直连、广告拦截，无需全局模式 |
+| 🔐 HTTPS 订阅向导 | Cloudflare DNS-01 自动签发、安装公开证书，配置每日续期检查和服务重载；支持 NAT 高位端口 |
 
 ### 版本支持矩阵
 
@@ -128,6 +129,10 @@ wget -O debian_xray_improved.sh https://raw.githubusercontent.com/GaoYanHai/Alpi
 chmod +x debian_xray_improved.sh
 sudo bash debian_xray_improved.sh
 ```
+
+两个安装脚本都包含订阅向导，单文件运行即可。交互安装时会提示选择 **Cloudflare 自动申请 HTTPS（默认选项）**、已有公开证书或 HTTP。选择自动申请后，按提示填写完整域名、公网订阅端口、设置 Cloudflare 灰云 A 记录与 NAT 映射，再隐藏输入 API Token；脚本自动安装 acme.sh、申请证书、配置续期和订阅服务，最后验证本机订阅。
+
+无交互终端且未指定 HTTPS 参数时，脚本保持 HTTP 并打印后续开启方法。域名托管在 Cloudflare 并不等于 VPS 已有可供客户端直接信任的证书，具体权限和步骤见下方「NAT VPS + Cloudflare 域名启用 HTTPS」。
 
 ### 诊断（连不上 / 延迟 -1ms 时先跑）
 
@@ -191,16 +196,16 @@ Hash32:     <不是客户端公钥，不要填>
 机场能自动出「直连 / 苹果 / 漏网之鱼」，是因为订阅内容本身就是 Clash 配置 + ACL4SSR 规则。
 `vless://` 只有节点，所以用 v2rayN 导入分享链接**不会**出现那些分组。
 
-安装脚本会在 **你自己的 VPS** 上生成 Clash 配置，并用带随机口令的 HTTP 地址提供订阅，例如：
+安装脚本会在 **你自己的 VPS** 上生成 Clash 配置，并输出带随机口令的订阅地址。选择 HTTPS 时，例如：
 
-`http://<公网IP>:58472/<随机口令>/clash.yaml`
+`https://sub.example.com:58472/<随机口令>/clash.yaml`
 
-默认地址使用明文 HTTP，客户端提示「HTTP 不安全」是正常的；随机口令不提供传输加密。脚本支持通过 `CLASH_SUB_HOST`、`CLASH_SUB_TLS_CERT`、`CLASH_SUB_TLS_KEY` 设置域名、PEM 完整证书链和私钥路径，直接在订阅端口启用 HTTPS，也可用现有网站反向代理。仅把 `http` 改成 `https` 无法启用 TLS。也可以通过 SSH/SCP 下载配置后在客户端本地导入。
+交互安装默认推荐 HTTPS。选择 HTTP 或无交互且未配置 HTTPS 时，地址为 `http://<公网IP>:58472/<随机口令>/clash.yaml`；随机口令不提供传输加密。也可以使用已有证书、现有网站反向代理，或通过 SSH/SCP 下载配置后在客户端本地导入。仅修改 URL 的协议不能启用 TLS。
 
 **不会**把节点发到 `api.v1.mk` 之类的第三方转换站。
 
 1. 打开 Clash Verge / mihomo
-2. 新建订阅，把终端打印的 `http://.../clash.yaml` 贴进去
+2. 新建订阅，把终端打印的 `https://.../clash.yaml` 或 `http://.../clash.yaml` 贴进去
 3. 点更新；模式保持 **Rule / 规则**，不要开全局
 4. 云安全组和 LXC/LXD 映射放行 **TCP 58472**（Clash 订阅口；改脚本顶部 `CLASH_SUB_PORT` 即可换端口）
 
@@ -210,11 +215,11 @@ Hash32:     <不是客户端公钥，不要填>
 | v2rayN | 推荐使用安装输出的 `vless.txt` 原生订阅，节点内核选 Xray，路由选「绕过大陆」 |
 | 订阅打不开 | 检查终端里那个高位端口的映射；或 `scp` 拉取 `/etc/xray/clash-meta.yaml` 本地导入 |
 
-订阅端口默认 58472，可以通过 `CLASH_SUB_PORT` 环境变量覆盖。
+订阅监听端口默认 58472，可以通过 `CLASH_SUB_PORT` 环境变量覆盖。NAT 外部端口不同时，通过向导或 `CLASH_SUB_PUBLIC_PORT` 指定；输出链接使用外部端口，服务仍监听内部端口。
 
 v2rayN 7.16.9 会把完整 Clash YAML 作为 **mihomo 自定义配置** 导入，和普通 VLESS 节点使用不同的内核处理路径。若 VLESS 可用但 Clash 订阅节点测速超时，可新建订阅分组，使用同一口令路径下的 `vless.txt`：
 
-`http://<公网IP>:58472/<随机口令>/vless.txt`
+`https://sub.example.com:58472/<随机口令>/vless.txt`（选择 HTTP 时使用脚本输出的 HTTP 地址）
 
 它返回原分享链接的 Base64 订阅，保留全部 Reality 参数；v2rayN 使用 Xray，分流由 v2rayN 路由设置控制，不包含 Clash 策略组。两种订阅都由自己的 VPS 提供。
 
@@ -231,29 +236,83 @@ DNS 默认使用国内 DoH，国外备用 Google / Cloudflare DoH 通过 `#🚀 
 把最新版 `subscription-update.sh` 和对应系统的安装脚本放在同一目录，运行：
 
 ```bash
+mkdir -p /root/xray-sub-update
+cd /root/xray-sub-update
+curl -fSL https://raw.githubusercontent.com/GaoYanHai/Alpine-3.8-/main/subscription-update.sh -o subscription-update.sh
+# Debian；Alpine 请将文件名替换为 alpine_xray_improved.sh
+curl -fSL https://raw.githubusercontent.com/GaoYanHai/Alpine-3.8-/main/debian_xray_improved.sh -o debian_xray_improved.sh
 bash subscription-update.sh
 ```
 
-工具复用 `/etc/xray/client-link.txt` 中与现有入站匹配的链接以及原订阅口令，备份后更新订阅文件、重启订阅服务，不改动 Xray 配置或重启 Xray。若单独下载工具，它会从本项目 main 获取安装脚本中的订阅函数。当前支持脚本默认的 IPv4、TCP、Vision、chrome 参数；修改过这些参数或入站/出站端口不一致时，请先校对分享链接。
+工具复用 `/etc/xray/client-link.txt` 中与现有入站匹配的链接以及原订阅口令，保留已有域名、证书、监听端口和公网端口，备份后更新订阅文件、重启订阅服务，不改动 Xray 配置或重启 Xray。若单独下载工具，它会从本项目 main 获取安装脚本中的订阅函数；同目录已有安装脚本时优先使用该文件，因此请同步更新。当前支持脚本默认的 IPv4、TCP、Vision、chrome 参数；修改过这些参数或入站/出站端口不一致时，请先校对分享链接。
 
 #### NAT VPS + Cloudflare 域名启用 HTTPS
 
-例如 `zor.zor.de5.net`：在 Cloudflare 为完整主机名 `zor.zor.de5.net` 添加 A 记录（名称相对于托管区域填写），指向 **NAT 宿主机的公网 IP**，设为 **仅 DNS（关闭小黄云）**。保留当前可用的订阅端口映射，例如宿主机 TCP 58472 → 容器 TCP 58472；TLS 可以运行在这个端口，不需要开放 443。外部端口与容器端口不同时，客户端 URL 使用外部端口。Reality 节点保持原公网 IP，不改为 Cloudflare 代理地址。
-
-通过 ACME DNS-01 验证申请 `zor.zor.de5.net` 的公开受信任证书，不需要入站 80/443。可以使用 acme.sh 的 `dns_cf` 插件，Cloudflare API Token 只在 VPS 本地配置，权限限定到对应域名的 DNS 编辑及必要的区域读取。**Cloudflare Origin CA 证书不能用于关闭小黄云后的直接访问。** 证书须覆盖完整域名；安装到稳定路径，勿直接使用 ACME 工具内部缓存。
-
-拿到完整证书链和私钥后，例如分别安装到 `/etc/xray/tls/fullchain.pem` 和 `/etc/xray/tls/key.pem`，运行：
+新安装时直接按向导操作。已有节点开启 HTTPS，在上方下载最新版文件后运行：
 
 ```bash
+bash subscription-update.sh --https
+```
+
+向导会提示需要你完成的步骤：
+
+1. 填写完整域名，例如 `zor.zor.de5.net`，不带协议、端口或路径。
+2. 在 Cloudflare 添加该域名的 A 记录，指向 **NAT 宿主机公网 IP**，设为 **仅 DNS（灰云）**；记录名称相对于托管区域填写。
+3. 在 NAT 面板或宿主机、安全组放行并映射订阅 TCP 端口，例如公网 `58472` → 容器 `58472`。外部端口不同时，在向导里填写实际公网端口。
+4. Cloudflare → 个人资料 → API 令牌 → 创建令牌，使用「编辑区域 DNS」模板。权限为 **区域 / DNS / 编辑** 和 **区域 / 区域 / 读取**，资源仅包含这个域名所属区域；将 Token 粘贴到 VPS 的隐藏输入提示中。
+
+此后脚本自动下载官方 acme.sh，使用 Let's Encrypt 的 DNS-01 验证签发 ECC 证书，安装到 `/etc/xray/tls/fullchain.pem` 和 `/etc/xray/tls/key.pem`，校验证书链、公私钥、域名及剩余有效期，然后开启订阅 HTTPS。无需开放入站 80/443，也无需修改 Reality 节点地址。
+
+**Cloudflare 边缘证书（Universal SSL）不能下载部署到 VPS；Origin CA 证书不能用于灰云后的客户端直接访问。** 自动向导会另行申请公开受信任证书。API Token 保存在仅 root 可访问的 acme.sh 配置中供续期使用，不写入订阅配置或客户端 URL；不要上传这些配置文件。
+
+安装完成后，用脚本输出的新地址替换客户端原 HTTP 订阅，例如：
+
+```text
+https://zor.zor.de5.net:58472/<原口令>/clash.yaml
+https://zor.zor.de5.net:58472/<原口令>/vless.txt
+```
+
+同一监听端口切换 TLS 后，旧 HTTP 地址不再适用。脚本会通过回环地址验证订阅可读和 HTTPS 证书可信；公网 DNS、NAT 转发与安全组还需从客户端访问链接确认。
+
+自动申请的证书会配置每日续期检查；只在证书需要续期时申请，更新后自动重新加载订阅服务：
+
+| 系统 | 续期任务 | 检查方法 |
+|------|----------|----------|
+| Debian | systemd timer，支持错过任务后补执行 | `systemctl list-timers xray-sub-renew.timer`；`journalctl -u xray-sub-renew.service` |
+| Alpine | `/etc/periodic/daily/xray-sub-renew`，自动启用 crond | `rc-service crond status`；`tail /var/log/xray-sub-renew.log` |
+
+已手动配置 HTTPS 的用户，普通更新会复用证书和原有续期方式；若需要接入本项目的自动续期，可运行 `bash subscription-update.sh --https`。已有证书未到续期时间时不会强制重新申请。
+
+自动签发失败时，脚本停止并给出重试提示，尚不改写订阅文件。先检查 Token 区域范围、DNS 权限、VPS 到 Cloudflare/GitHub/Let's Encrypt 的网络和 ACME 错误信息，再运行 `bash subscription-update.sh --https`；不要为此重装 Xray。Let's Encrypt 有签发频率限制，不要反复强制申请。
+
+也可以使用自己管理的公开证书：
+
+```bash
+CLASH_SUB_HTTPS=existing \
 CLASH_SUB_HOST=zor.zor.de5.net \
 CLASH_SUB_TLS_CERT=/etc/xray/tls/fullchain.pem \
 CLASH_SUB_TLS_KEY=/etc/xray/tls/key.pem \
 bash subscription-update.sh
 ```
 
-保持原端口 58472 时，输出的 v2rayN 地址将是 `https://zor.zor.de5.net:58472/<原口令>/vless.txt`。同一端口切换为 TLS 后，旧 `http://` 地址需改为 `https://`。证书续期后需要重启订阅服务以重新加载证书：Debian 使用 `systemctl restart xray-clash-sub.service`，Alpine 使用 `sh /etc/local.d/clash-sub.start`，可配置为证书工具的续期钩子。证书文件需允许服务读取，私钥保持仅 root 可读。
+此模式校验证书但不接管签发和续期。证书工具续期后应执行：Debian 为 `systemctl restart xray-clash-sub.service`，Alpine 为 `sh /etc/local.d/clash-sub.start`。证书须覆盖完整域名，使用完整证书链；私钥保持仅 root 可读。
+
+支持的环境变量（两个安装脚本及订阅更新工具通用）：
+
+| 变量 | 默认 / 用途 |
+|------|-------------|
+| `CLASH_SUB_HTTPS` | `auto`：复用已有证书，或启动交互选择；`cloudflare`：自动签发；`existing`：自有证书；`off`：HTTP（已有 TLS 时拒绝直接降级） |
+| `CLASH_SUB_HOST` | 完整订阅域名；auto 模式下设置域名且无证书时进入 Cloudflare 自动签发 |
+| `CLASH_SUB_PORT` | 订阅监听端口，默认 `58472` |
+| `CLASH_SUB_PUBLIC_PORT` | NAT 公网订阅端口，默认等于监听端口，写入生成的 URL |
+| `CLASH_SUB_TLS_CERT` / `CLASH_SUB_TLS_KEY` | existing 模式的 PEM 完整证书链和私钥路径；设置两者时 auto 自动复用 |
+| `CF_Token` | Cloudflare 自动签发时可从环境提供；未设置时隐藏输入，非交互运行必须提供 |
+
+无人值守示例：从安全的本机环境预先导出 `CF_Token`，完成 DNS/NAT 后运行 `CLASH_SUB_HTTPS=cloudflare CLASH_SUB_HOST=sub.example.com bash debian_xray_improved.sh`；Alpine 换成 `sh alpine_xray_improved.sh`。不要将真实 Token 写入公开命令示例或提交到仓库。
 
 如以后改用 Cloudflare 代理，需使用它支持的 HTTPS 端口（例如 443 或 8443），SSL/TLS 设为 Full (strict)，并正确映射到启用 TLS 的订阅服务；58472 不在常规代理支持范围。
+
+同一节点出现 YAML 慢、VLESS 快时，先在 YAML 的 GLOBAL 分组明确选择同一节点进行对照，再观察实际视频连接与下载速度。全局模式仍沿用 YAML 的 DNS；YouTube 的 Connection Speed 是分段下载估算值，单次波动不能证明规则或内核限速。持续慢时应记录相同视频、清晰度、实际命中节点和测速时间，再比较两个内核。
 
 规则模板：[ACL4SSR_Online.ini](https://github.com/ACL4SSR/ACL4SSR/blob/master/Clash/config/ACL4SSR_Online.ini)
 

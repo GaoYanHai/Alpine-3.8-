@@ -38,7 +38,10 @@ class SubscriptionTest(unittest.TestCase):
                     '&security=reality&sni=example.com&sid=0123456789abcdef&fp=chrome&type=tcp&pbk=fixture-key')
             (folder/'config.json').write_text(json.dumps(node))
             (folder/'share.txt').write_text(link+'\n')
-            (folder/'sub.env').write_text('CLASH_SUB_TOKEN=original-token\nCLASH_SUB_PORT=58472\n')
+            (folder/'sub.env').write_text('CLASH_SUB_TOKEN=original-token\nCLASH_SUB_PORT=58472\n'
+                                         'CLASH_SUB_PUBLIC_PORT=58474\nCLASH_SUB_HOST=sub.example.com\n'
+                                         'CLASH_SUB_TLS_CERT=/etc/xray/tls/fullchain.pem\n'
+                                         'CLASH_SUB_TLS_KEY=/etc/xray/tls/key.pem\n')
             env = os.environ.copy()
             env['CLASH_SUB_PORT'] = '58473'
             args = [sys.executable, '-', str(folder/'config.json'), str(folder/'share.txt'), str(folder/'sub.env')]
@@ -46,6 +49,10 @@ class SubscriptionTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('CLASH_SUB_TOKEN=original-token', result.stdout)
             self.assertIn('CLASH_SUB_PORT=58473', result.stdout)
+            self.assertIn('CLASH_SUB_PUBLIC_PORT=58474', result.stdout)
+            self.assertIn('CLASH_SUB_HOST=sub.example.com', result.stdout)
+            self.assertIn('CLASH_SUB_TLS_CERT=/etc/xray/tls/fullchain.pem', result.stdout)
+            self.assertIn('CLASH_SUB_TLS_KEY=/etc/xray/tls/key.pem', result.stdout)
             self.assertIn('PUB_KEY=fixture-key', result.stdout)
             (folder/'share.txt').write_text(link.replace('fixture-uuid@', 'stale-uuid@'))
             result = subprocess.run(args, input=parser, text=True, capture_output=True, env=env, encoding='utf-8')
@@ -75,7 +82,7 @@ class SubscriptionTest(unittest.TestCase):
                     SHARE_LINK=link, CLEAR_IP='203.0.113.10', PORT='52300',
                     USER_UUID='11111111-1111-4111-8111-111111111111',
                     SNI='example.com', PUB_KEY='A'*43, SHORT_ID='0000000000000010',
-                    CLASH_SUB_PORT='58472', CLASH_SUB_TOKEN='test-token',
+                    CLASH_SUB_PORT='58472', CLASH_SUB_PUBLIC_PORT='58473', CLASH_SUB_TOKEN='test-token',
                     CLASH_SUB_HOST='sub.example.com', CLASH_SUB_TLS_CERT='', CLASH_SUB_TLS_KEY='')
                 assignments = '\n'.join(k+'='+shlex.quote(v) for k, v in values.items())
                 runner = ('set -eu\n' + ('PATH=/usr/bin:$PATH\n' if os.name == 'nt' else '') + assignments + '\n'
@@ -86,7 +93,8 @@ class SubscriptionTest(unittest.TestCase):
                                         encoding='utf-8')
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(base64.b64decode((folder/'vless.txt').read_bytes()).decode(), link+'\n')
-                self.assertIn('http://sub.example.com:58472/test-token/vless.txt', result.stdout)
+                self.assertIn('http://sub.example.com:58473/test-token/vless.txt', result.stdout)
+                self.assertIn('CLASH_SUB_PUBLIC_PORT=58473', (folder/'sub.env').read_text())
                 yaml = (folder/'clash.yaml').read_text(encoding='utf-8')
                 self.assertIn('server: 203.0.113.10', yaml)
                 self.assertIn('short-id: "0000000000000010"', yaml)
@@ -160,6 +168,21 @@ class SubscriptionTest(unittest.TestCase):
                         with self.assertRaises(urllib.error.HTTPError) as error:
                             opener.open(url+'/wrong-token/vless.txt', timeout=2)
                         self.assertEqual(error.exception.code, 404)
+                        check = source.split('subscription_verify_local() {', 1)[1].split(
+                            "<<'PY'\n", 1)[1].split('\nPY\n', 1)[0]
+                        check_env = os.environ.copy()
+                        if secure:
+                            check_env['SSL_CERT_FILE'] = str(cert)
+                        args = [sys.executable, '-', 'localhost', str(port), 'fixture-token',
+                                str(cert) if secure else '']
+                        result = subprocess.run(args, input=check, text=True, capture_output=True,
+                                                encoding='utf-8', env=check_env, timeout=15)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        if secure:
+                            args[2] = 'wrong.example.com'
+                            result = subprocess.run(args, input=check, text=True, capture_output=True,
+                                                    encoding='utf-8', env=check_env, timeout=15)
+                            self.assertNotEqual(result.returncode, 0)
                         if secure:
                             untrusted = urllib.request.build_opener(urllib.request.ProxyHandler({}))
                             with self.assertRaises(urllib.error.URLError):

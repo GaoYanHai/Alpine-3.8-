@@ -3,6 +3,17 @@
 set -eu
 umask 077
 
+case "${1:-}" in
+    --https) CLASH_SUB_HTTPS=cloudflare ;;
+    --help|-h)
+        echo "用法: bash subscription-update.sh [--https]"
+        echo "默认保留原订阅域名、证书、端口和口令；--https 启动 Cloudflare DNS-01 HTTPS 向导。"
+        exit 0 ;;
+    '') ;;
+    *) echo "未知参数，使用 --help 查看用法" >&2; exit 1 ;;
+esac
+[ "$#" -le 1 ] || { echo "参数过多" >&2; exit 1; }
+
 [ "$(id -u)" = 0 ] || { echo "请以 root 运行" >&2; exit 1; }
 for cmd in python3 base64; do
     command -v "$cmd" >/dev/null || { echo "缺少命令: $cmd" >&2; exit 1; }
@@ -88,7 +99,7 @@ values = dict(SHARE_LINK=link, CLEAR_IP=uri.hostname, PORT=str(uri.port),
               USER_UUID=uri.username, SNI=query['sni'][0],
               SHORT_ID=query.get('sid', [''])[0], PUB_KEY=query['pbk'][0])
 if Path(sys.argv[3]).is_file():
-    allowed = {'CLASH_SUB_PORT', 'CLASH_SUB_TOKEN', 'CLASH_SUB_HOST', 'CLASH_SUB_TLS_CERT', 'CLASH_SUB_TLS_KEY'}
+    allowed = {'CLASH_SUB_PORT', 'CLASH_SUB_PUBLIC_PORT', 'CLASH_SUB_TOKEN', 'CLASH_SUB_HOST', 'CLASH_SUB_TLS_CERT', 'CLASH_SUB_TLS_KEY'}
     for line in Path(sys.argv[3]).read_text().splitlines():
         key, sep, value = line.partition('=')
         if sep and key in allowed:
@@ -102,21 +113,12 @@ CLASH_SUB_TOKEN="${CLASH_SUB_TOKEN:-}"
 CLASH_SUB_HOST="${CLASH_SUB_HOST:-}"
 CLASH_SUB_TLS_CERT="${CLASH_SUB_TLS_CERT:-}"
 CLASH_SUB_TLS_KEY="${CLASH_SUB_TLS_KEY:-}"
-case "$CLASH_SUB_PORT" in ''|*[!0-9]*) echo "订阅端口无效" >&2; exit 1;; esac
-[ "$CLASH_SUB_PORT" -ge 1 ] && [ "$CLASH_SUB_PORT" -le 65535 ] || exit 1
-[ "$CLASH_SUB_PORT" != "$PORT" ] || { echo "订阅端口不能与 Reality 端口相同" >&2; exit 1; }
-if [ -n "$CLASH_SUB_TLS_CERT" ] || [ -n "$CLASH_SUB_TLS_KEY" ]; then
-    [ -n "$CLASH_SUB_HOST" ] || { echo "请设置 CLASH_SUB_HOST" >&2; exit 1; }
-    python3 - "$CLASH_SUB_TLS_CERT" "$CLASH_SUB_TLS_KEY" <<'PY'
-import ssl
-import sys
-ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(*sys.argv[1:])
-PY
-fi
 
 error_exit() { echo "$*" >&2; exit 1; }
 open_firewall_port() { echo "请保持 NAT 宿主机映射和防火墙放行 TCP $1"; }
 . "$task_tmp/functions.sh"
+command -v configure_subscription_https >/dev/null || error_exit "安装脚本版本过旧，请下载最新版安装脚本后重试"
+configure_subscription_https
 
 backup_dir="/etc/xray/subscription-backup-$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$backup_dir"
@@ -130,5 +132,7 @@ if [ "$installer" = debian_xray_improved.sh ]; then
 else
     pgrep -f /usr/local/bin/xray-clash-sub.py >/dev/null || error_exit "订阅服务启动失败，请检查 /var/log/xray-clash-sub.log"
 fi
+subscription_verify_local
 echo "订阅已更新。原有订阅文件备份: $backup_dir"
-echo "v2rayN 请新建订阅分组，使用 vless.txt 链接，节点内核选择 Xray。"
+echo "保留 Clash 策略组：使用 clash.yaml，内核为 mihomo；原生 VLESS：使用 vless.txt，内核选择 Xray。"
+echo "若从 HTTP 切换至 HTTPS，请在客户端替换订阅地址后更新。"
