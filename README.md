@@ -218,7 +218,9 @@ v2rayN 7.16.9 会把完整 Clash YAML 作为 **mihomo 自定义配置** 导入�
 
 它返回原分享链接的 Base64 订阅，保留全部 Reality 参数；v2rayN 使用 Xray，分流由 v2rayN 路由设置控制，不包含 Clash 策略组。两种订阅都由自己的 VPS 提供。
 
-已有安装遇到订阅异常时，无需重装 Xray：先修改服务器上的 `/etc/xray/clash-meta.yaml`，再在客户端更新订阅。ACL4SSR 的 `.list` 是纯文本，每个 `rule-providers` 项需要在 `behavior: classical` 同级设置 `format: text`；否则可能语法检查通过却加载 0 条规则。自动选择组的测速地址使用 `https://www.gstatic.com/generate_204`，Reality 的 `short-id` 应加引号，避免纯数字值或前导零被 YAML 转换。只点「更新订阅」不会修复服务器上原有的文件。
+已有安装遇到订阅异常时，无需重装 Xray：先更新服务器上的 `/etc/xray/clash-meta.yaml`，再在客户端更新订阅。ACL4SSR 的 `.list` 是纯文本，对应 `rule-providers` 项需要在 `behavior: classical` 同级设置 `format: text`；否则可能语法检查通过却加载 0 条规则。`ChinaMedia` 和 `ProxyMedia` 改用官方 `Clash/Providers/*.yaml` 及 `format: yaml`，其中不支持的 `URL-REGEX` 已被上游注释；它们使用新的缓存路径，避免旧文本缓存按 YAML 解析。自动选择组的测速地址使用 `https://www.gstatic.com/generate_204`，Reality 的 `short-id` 应加引号，避免纯数字值或前导零被 YAML 转换。只点「更新订阅」不会修复服务器上原有的文件。
+
+DNS 默认使用国内 DoH，国外备用 Google / Cloudflare DoH 通过 `#🚀 节点选择` 显式走代理，避免在客户端网络直接连接时被阻断。直连流量使用独立的国内 `direct-nameserver`，避免微软等默认直连的服务被国外备用 DNS 超时拖住。若仍有 `dns resolve failed`，检查本机到国内 DNS 的访问以及节点选择组是否选了可用代理。启动后的单次 `-1 ms` 只表示那次测速未成功，需等启动完成后再测；`系统代理设置改变 - ForcedChange` 是客户端代理设置事件。
 
 如果同一节点的 VLESS 链接可用，但 Clash 仍然超时，请对比订阅中的 `server`、`port`、`uuid`、`flow`、`servername`、`client-fingerprint` 和 `reality-opts`，并检查客户端日志。规则加载失败、测速目标不可达和 Reality 握手失败是不同的问题，不能仅凭 HTTP 提示判断节点故障。
 

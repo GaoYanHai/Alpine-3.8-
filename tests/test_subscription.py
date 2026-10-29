@@ -91,7 +91,15 @@ class SubscriptionTest(unittest.TestCase):
                 self.assertIn('server: 203.0.113.10', yaml)
                 self.assertIn('short-id: "0000000000000010"', yaml)
                 self.assertIn('      support-x25519mlkem768: true\n', yaml)
-                self.assertEqual(yaml.count('    format: text\n'), 15)
+                self.assertEqual(yaml.count('    format: text\n'), 13)
+                self.assertEqual(yaml.count('    format: yaml\n'), 2)
+                for provider in ('ChinaMedia', 'ProxyMedia'):
+                    self.assertIn('/Providers/'+provider+'.yaml"', yaml)
+                    self.assertIn('path: ./ruleset/'+provider+'-provider.yaml', yaml)
+                    self.assertNotIn('/'+provider+'.list"', yaml)
+                self.assertIn('  direct-nameserver:\n    - https://doh.pub/dns-query\n', yaml)
+                for resolver in ('dns.google', 'cloudflare-dns.com'):
+                    self.assertIn('"https://'+resolver+'/dns-query#🚀 节点选择"', yaml)
                 self.assertEqual(json.loads((folder/'client.json').read_text())['outbounds'][0]
                                  ['settings']['vnext'][0]['address'], '203.0.113.10')
 

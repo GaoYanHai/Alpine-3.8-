@@ -33,9 +33,13 @@ dns:
   nameserver:
     - https://doh.pub/dns-query
     - https://dns.alidns.com/dns-query
+  # 直连连接使用国内 DNS；国外备用 DoH 显式经过节点选择组。
+  direct-nameserver:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
   fallback:
-    - https://dns.google/dns-query
-    - https://cloudflare-dns.com/dns-query
+    - "https://dns.google/dns-query#🚀 节点选择"
+    - "https://cloudflare-dns.com/dns-query#🚀 节点选择"
   fallback-filter:
     geoip: true
     geoip-code: CN
@@ -201,9 +205,9 @@ rule-providers:
   ProxyMedia:
     type: http
     behavior: classical
-    format: text
-    url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/ProxyMedia.list"
-    path: ./ruleset/ProxyMedia.yaml
+    format: yaml
+    url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/ProxyMedia.yaml"
+    path: ./ruleset/ProxyMedia-provider.yaml
     interval: 86400
   ProxyGFWlist:
     type: http
@@ -215,9 +219,9 @@ rule-providers:
   ChinaMedia:
     type: http
     behavior: classical
-    format: text
-    url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/ChinaMedia.list"
-    path: ./ruleset/ChinaMedia.yaml
+    format: yaml
+    url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/ChinaMedia.yaml"
+    path: ./ruleset/ChinaMedia-provider.yaml
     interval: 86400
   ChinaDomain:
     type: http
