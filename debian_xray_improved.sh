@@ -619,6 +619,7 @@ proxies:
     reality-opts:
       public-key: ${PUB_KEY}
       short-id: "${SHORT_ID}"
+      support-x25519mlkem768: true
 
 proxy-groups:
   - name: 🚀 节点选择

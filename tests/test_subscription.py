@@ -90,6 +90,7 @@ class SubscriptionTest(unittest.TestCase):
                 yaml = (folder/'clash.yaml').read_text(encoding='utf-8')
                 self.assertIn('server: 203.0.113.10', yaml)
                 self.assertIn('short-id: "0000000000000010"', yaml)
+                self.assertIn('      support-x25519mlkem768: true\n', yaml)
                 self.assertEqual(yaml.count('    format: text\n'), 15)
                 self.assertEqual(json.loads((folder/'client.json').read_text())['outbounds'][0]
                                  ['settings']['vnext'][0]['address'], '203.0.113.10')

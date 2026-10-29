@@ -222,6 +222,8 @@ v2rayN 7.16.9 会把完整 Clash YAML 作为 **mihomo 自定义配置** 导入�
 
 如果同一节点的 VLESS 链接可用，但 Clash 仍然超时，请对比订阅中的 `server`、`port`、`uuid`、`flow`、`servername`、`client-fingerprint` 和 `reality-opts`，并检查客户端日志。规则加载失败、测速目标不可达和 Reality 握手失败是不同的问题，不能仅凭 HTTP 提示判断节点故障。
 
+若服务端使用新版 Xray，而 mihomo 报 `REALITY authentication failed`，需检查 `reality-opts` 下的 `support-x25519mlkem768: true`。mihomo 默认关闭此选项并移除握手中的 X25519MLKEM768；本项目已将其开启。在 Xray 26.10.21、SNI `www.bmw.com` 的同节点对照测试中，关闭时认证失败，开启后 mihomo 1.19.12 和 1.19.16 均测速成功。该设置面向支持 X25519MLKEM768 的新版服务端，旧版服务端需按兼容情况调整。
+
 #### 已安装 VPS 更新订阅（不重装 Xray）
 
 把最新版 `subscription-update.sh` 和对应系统的安装脚本放在同一目录，运行：

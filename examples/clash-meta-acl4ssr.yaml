@@ -57,6 +57,7 @@ proxies:
     reality-opts:
       public-key: YOUR_PUBLIC_KEY
       short-id: "0123456789abcdef"
+      support-x25519mlkem768: true
 
 proxy-groups:
   - name: 🚀 节点选择
