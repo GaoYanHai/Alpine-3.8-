@@ -16,6 +16,7 @@ fi
 
 # 0. 自定义基础变量
 PORT="${PORT:-52300}"
+NODE_PUBLIC_PORT="${NODE_PUBLIC_PORT:-}" # NAT 公网节点端口，默认与监听端口相同
 CLASH_SUB_PORT="${CLASH_SUB_PORT:-58472}"   # Clash / v2rayN 订阅端口
 CLASH_SUB_HTTPS="${CLASH_SUB_HTTPS:-auto}" # auto/cloudflare/existing/import/off
 CLASH_SUB_PUBLIC_PORT="${CLASH_SUB_PUBLIC_PORT:-}" # NAT 外部端口，默认等于监听端口
@@ -645,7 +646,7 @@ proxies:
   - name: ${node_name}
     type: vless
     server: ${client_addr}
-    port: ${PORT}
+    port: ${NODE_PUBLIC_PORT:-$PORT}
     uuid: ${USER_UUID}
     network: tcp
     tls: true
@@ -900,7 +901,7 @@ YAML
             "settings": {
                 "vnext": [{
                     "address": "${client_addr}",
-                    "port": ${PORT},
+                    "port": ${NODE_PUBLIC_PORT:-$PORT},
                     "users": [{
                         "id": "${USER_UUID}",
                         "encryption": "none",
@@ -1011,17 +1012,18 @@ JSON
     if [ -z "$CLASH_SUB_TOKEN" ]; then
         CLASH_SUB_TOKEN=$(date +%s | md5sum 2>/dev/null | awk '{print $1}')
     fi
-    cat > /etc/xray/clash-sub.env << ENV
+    cat > "${SUB_ENV:-/etc/xray/clash-sub.env}" << ENV
+NODE_PUBLIC_PORT=${NODE_PUBLIC_PORT:-$PORT}
 CLASH_SUB_PORT=$CLASH_SUB_PORT
 CLASH_SUB_PUBLIC_PORT=${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT}
 CLASH_SUB_HOST=$CLASH_SUB_HOST
 CLASH_SUB_TOKEN=$CLASH_SUB_TOKEN
-CLASH_SUB_FILE=$CLASH_FILE
-V2RAYN_SUB_FILE=$V2RAYN_SUB_FILE
+CLASH_SUB_FILE=${SUBSCRIPTION_LIVE_CLASH_FILE:-$CLASH_FILE}
+V2RAYN_SUB_FILE=${SUBSCRIPTION_LIVE_V2RAYN_FILE:-$V2RAYN_SUB_FILE}
 CLASH_SUB_TLS_CERT=$CLASH_SUB_TLS_CERT
 CLASH_SUB_TLS_KEY=$CLASH_SUB_TLS_KEY
 ENV
-    chmod 600 /etc/xray/clash-sub.env 2>/dev/null || true
+    chmod 600 "${SUB_ENV:-/etc/xray/clash-sub.env}" 2>/dev/null || true
     CLASH_SUB_URL="${sub_scheme}://${sub_host}:${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT}/${CLASH_SUB_TOKEN}/clash.yaml"
     V2RAYN_SUB_URL="${sub_scheme}://${sub_host}:${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT}/${CLASH_SUB_TOKEN}/vless.txt"
 
@@ -1070,11 +1072,11 @@ subscription_prompt() {
 }
 
 subscription_validate_options() {
-    python3 - "$CLASH_SUB_HOST" "$CLASH_SUB_PORT" "$CLASH_SUB_PUBLIC_PORT" "${PORT:-52300}" <<'PY'
+    python3 - "$CLASH_SUB_HOST" "$CLASH_SUB_PORT" "$CLASH_SUB_PUBLIC_PORT" "${PORT:-52300}" "${NODE_PUBLIC_PORT:-${PORT:-52300}}" <<'PY'
 import ipaddress
 import re
 import sys
-host, port, public_port, reality_port = sys.argv[1:]
+host, port, public_port, reality_port, reality_public_port = sys.argv[1:]
 if host:
     if len(host) > 253 or '.' not in host or any(not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label) for label in host.split('.')):
         sys.exit('订阅域名无效：只填写完整域名，不带 https://、端口或路径。')
@@ -1089,6 +1091,8 @@ for value in (port, public_port):
         sys.exit('订阅端口必须在 1–65535 之间。')
 if int(port) == int(reality_port):
     sys.exit('订阅监听端口不能与 Reality 端口相同。')
+if int(public_port) == int(reality_public_port):
+    sys.exit('订阅公网端口不能与 Reality 公网端口相同。')
 PY
 }
 
@@ -1440,8 +1444,13 @@ configure_subscription_https() {
                 [ "$sub_ready" != q ] || error_exit "已退出；设置完成后可重新运行订阅更新工具"
             fi
             if [ "$CLASH_SUB_HTTPS" = cloudflare ]; then
-                CLASH_SUB_TLS_CERT=/etc/xray/tls/fullchain.pem
-                CLASH_SUB_TLS_KEY=/etc/xray/tls/key.pem
+                # Keep each domain's ACME files separate so a hostname change
+                # cannot overwrite the working certificate needed for rollback.
+                sub_domain_tls="$XRAY_DIR/tls/acme-$CLASH_SUB_HOST"
+                mkdir -p "$sub_domain_tls" || error_exit "无法创建证书目录"
+                chmod 700 "$sub_domain_tls" || error_exit "无法设置证书目录权限"
+                CLASH_SUB_TLS_CERT="$sub_domain_tls/fullchain.pem"
+                CLASH_SUB_TLS_KEY="$sub_domain_tls/key.pem"
                 subscription_setup_cloudflare || error_exit "HTTPS 配置未完成，原订阅文件尚未改写。检查 Token 权限/网络后运行 sh xray.sh，选择 3 重试；不要反复重装 Xray。"
             else
                 if [ -z "$CLASH_SUB_TLS_CERT" ]; then
@@ -1663,6 +1672,9 @@ configure_socks_optional() {
     fi
     if [ "$SOCKS_PORT" = "$PORT" ]; then
         error_exit "SOCKS5 端口不能与 Reality 端口相同 ($PORT)"
+    fi
+    if [ "$SOCKS_PORT" = "$CLASH_SUB_PORT" ]; then
+        error_exit "SOCKS5 端口不能与订阅端口相同 ($CLASH_SUB_PORT)"
     fi
 
     # 用户名/密码：启用则必填；密码不做强度校验
@@ -2099,10 +2111,11 @@ CLEAR_IP=$(get_public_ip)
 
 # 生成可导入的分享链接，减少手工填错（这是 -1ms 的高发原因）
 PBK_ENC=$(urlencode "$PUB_KEY")
-SHARE_LINK="vless://${USER_UUID}@${CLEAR_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PBK_ENC}&sid=${SHORT_ID}&type=tcp#Alpine-Reality-${PORT}"
+SHARE_LINK="vless://${USER_UUID}@${CLEAR_IP}:${NODE_PUBLIC_PORT:-$PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PBK_ENC}&sid=${SHORT_ID}&type=tcp#Alpine-Reality-${PORT}"
 cat > "$SHARE_FILE" << LINKEOF
 地址 (Address): $CLEAR_IP
-端口 (Port): $PORT
+端口 (Port): ${NODE_PUBLIC_PORT:-$PORT}
+容器监听端口: $PORT
 用户 ID (UUID): $USER_UUID
 流控 (Flow): xtls-rprx-vision
 传输安全 (Security): reality
@@ -2128,7 +2141,8 @@ cat << EOF
 ✅ 安装成功！请妥善保存以下连接参数：
 -------------------------------------------------------
 地址 (Address): $CLEAR_IP
-端口 (Port): $PORT
+端口 (Port): ${NODE_PUBLIC_PORT:-$PORT}
+容器监听端口: $PORT
 用户 ID (UUID): $USER_UUID
 流控 (Flow): xtls-rprx-vision
 传输安全 (Security): reality
@@ -2658,11 +2672,12 @@ fi
 echo "正在获取公网 IP..."
 CLEAR_IP=$(get_public_ip)
 PBK_ENC=$(urlencode "$PUB_KEY")
-SHARE_LINK="vless://${USER_UUID}@${CLEAR_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PBK_ENC}&sid=${SHORT_ID}&type=tcp#Debian-Reality-${PORT}"
+SHARE_LINK="vless://${USER_UUID}@${CLEAR_IP}:${NODE_PUBLIC_PORT:-$PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PBK_ENC}&sid=${SHORT_ID}&type=tcp#Debian-Reality-${PORT}"
 
 cat > "$SHARE_FILE" << LINKEOF
 地址 (Address): $CLEAR_IP
-端口 (Port): $PORT
+端口 (Port): ${NODE_PUBLIC_PORT:-$PORT}
+容器监听端口: $PORT
 用户 ID (UUID): $USER_UUID
 流控 (Flow): xtls-rprx-vision
 传输安全 (Security): reality
@@ -2688,7 +2703,8 @@ cat << EOF
 ✅ 安装成功！请妥善保存以下连接参数：
 -------------------------------------------------------
 地址 (Address): $CLEAR_IP
-端口 (Port): $PORT
+端口 (Port): ${NODE_PUBLIC_PORT:-$PORT}
+容器监听端口: $PORT
 用户 ID (UUID): $USER_UUID
 流控 (Flow): xtls-rprx-vision
 传输安全 (Security): reality
@@ -2771,20 +2787,9 @@ EOF
 
 )
 
-# 使用现有节点重新生成订阅。
-update_subscription() (
-    set -eu
-    umask 077
-    for cmd in python3 base64; do
-        command -v "$cmd" >/dev/null || error_exit "缺少命令: $cmd；请先安装本项目 Xray"
-    done
-    SUB_ENV=/etc/xray/clash-sub.env
-    task_tmp=$(mktemp -d)
-    trap 'rm -rf -- "$task_tmp"' EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
+load_node_settings() {
 # 使用 shlex 编码后再读取，节点或环境文件中的内容不能成为 shell 命令。
-python3 - "$XRAY_CONFIG" "$SHARE_FILE" "$SUB_ENV" > "$task_tmp/node.env" <<'PY'
+python3 - "$XRAY_CONFIG" "$SHARE_FILE" "${SUB_ENV:-/etc/xray/clash-sub.env}" <<'PY'
 import ipaddress
 import json
 import os
@@ -2796,6 +2801,12 @@ from urllib.parse import parse_qs, urlsplit
 
 config = json.loads(Path(sys.argv[1]).read_text())
 links = re.findall(r'^vless://\S+', Path(sys.argv[2]).read_text(), re.M)
+saved = {}
+if Path(sys.argv[3]).is_file():
+    for line in Path(sys.argv[3]).read_text().splitlines():
+        key, sep, value = line.partition('=')
+        if sep:
+            saved[key] = value.strip()
 selected = None
 for link in links:
     uri = urlsplit(link)
@@ -2804,7 +2815,7 @@ for link in links:
         reality = inbound.get('streamSettings', {}).get('realitySettings', {})
         clients = inbound.get('settings', {}).get('clients', [])
         if (inbound.get('protocol') == 'vless'
-                and uri.port == inbound.get('port')
+                and uri.port == int(saved.get('NODE_PUBLIC_PORT') or inbound.get('port', 0))
                 and any(c.get('id') == uri.username and c.get('flow') == query.get('flow', [''])[0] for c in clients)
                 and query.get('sni', [''])[0] in reality.get('serverNames', [])
                 and query.get('sid', [''])[0] in reality.get('shortIds', [])
@@ -2822,18 +2833,35 @@ if not selected:
 link, uri, query = selected
 if ipaddress.ip_address(uri.hostname).version != 4:
     sys.exit('当前订阅模板需要原节点的公网 IPv4 地址')
-values = dict(SHARE_LINK=link, CLEAR_IP=uri.hostname, PORT=str(uri.port),
+values = dict(SHARE_LINK=link, CLEAR_IP=uri.hostname, PORT=str(inbound['port']),
+              NODE_PUBLIC_PORT=str(uri.port),
+              XRAY_LOG_LEVEL=config.get('log', {}).get('loglevel', 'warning'),
               USER_UUID=uri.username, SNI=query['sni'][0],
               SHORT_ID=query.get('sid', [''])[0], PUB_KEY=query['pbk'][0])
-if Path(sys.argv[3]).is_file():
-    allowed = {'CLASH_SUB_PORT', 'CLASH_SUB_PUBLIC_PORT', 'CLASH_SUB_TOKEN', 'CLASH_SUB_HOST', 'CLASH_SUB_TLS_CERT', 'CLASH_SUB_TLS_KEY'}
-    for line in Path(sys.argv[3]).read_text().splitlines():
-        key, sep, value = line.partition('=')
-        if sep and key in allowed:
-            values[key] = os.environ.get(key, value.strip())
+allowed = {'CLASH_SUB_PORT', 'CLASH_SUB_PUBLIC_PORT', 'CLASH_SUB_TOKEN', 'CLASH_SUB_HOST', 'CLASH_SUB_TLS_CERT', 'CLASH_SUB_TLS_KEY'}
+for key in allowed:
+    if key in os.environ:
+        values[key] = os.environ[key]
+    elif key in saved:
+        values[key] = saved[key]
 for key, value in values.items():
     print(key + '=' + shlex.quote(value))
 PY
+}
+
+# 使用现有节点重新生成订阅。
+update_subscription() (
+    set -eu
+    umask 077
+    for cmd in python3 base64; do
+        command -v "$cmd" >/dev/null || error_exit "缺少命令: $cmd；请先安装本项目 Xray"
+    done
+    SUB_ENV="$XRAY_DIR/clash-sub.env"
+    task_tmp=$(mktemp -d)
+    trap 'rm -rf -- "$task_tmp"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+load_node_settings > "$task_tmp/node.env"
 . "$task_tmp/node.env"
 if [ "$CLASH_SUB_HTTPS" = auto ]; then
     if [ -n "$CLASH_SUB_TLS_CERT$CLASH_SUB_TLS_KEY" ]; then
@@ -2850,7 +2878,7 @@ CLASH_SUB_TLS_KEY="${CLASH_SUB_TLS_KEY:-}"
 
 configure_subscription_https
 
-backup_dir="/etc/xray/subscription-backup-$(date +%Y%m%d-%H%M%S)-$$"
+backup_dir="$XRAY_DIR/subscription-backup-$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$backup_dir"
 for file in "$SHARE_FILE" "$CLASH_FILE" "$XRAY_CLIENT_FILE" "$V2RAYN_SUB_FILE" "$SUB_ENV" /usr/local/bin/xray-clash-sub.py; do
     [ ! -f "$file" ] || cp -p "$file" "$backup_dir/"
@@ -2913,13 +2941,15 @@ LISTEN=$(sed -n 's/.*"listen"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY
 FLOW=$(sed -n 's/.*"flow"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
 
 [ -z "$XRAY_PORT" ] && XRAY_PORT="52300"
+XRAY_PUBLIC_PORT=$(sed -n 's/^NODE_PUBLIC_PORT=\([0-9][0-9]*\)$/\1/p' "$XRAY_DIR/clash-sub.env" 2>/dev/null | head -n 1)
+validate_port "$XRAY_PUBLIC_PORT" || XRAY_PUBLIC_PORT="$XRAY_PORT"
 [ -z "$SNI" ] && SNI="unknown"
 [ -z "$LISTEN" ] && LISTEN="(未显式配置，默认 0.0.0.0)"
 
 echo "配置摘要"
 echo "  配置文件: $XRAY_CONFIG"
 echo "  监听: $LISTEN"
-echo "  端口: $XRAY_PORT"
+echo "  容器监听端口: $XRAY_PORT；公网客户端端口: $XRAY_PUBLIC_PORT"
 echo "  UUID: ${UUID:-未读到}"
 echo "  Flow: ${FLOW:-未读到}"
 echo "  SNI: $SNI"
@@ -3237,12 +3267,12 @@ echo "🔟 外网可达性（需在【你的电脑】上测）"
 echo "=========================================="
 echo "下面这些命令请在客户端电脑执行，不要只在 VPS 里测："
 echo "  # Windows PowerShell"
-echo "  Test-NetConnection -ComputerName <公网IP> -Port $XRAY_PORT"
+echo "  Test-NetConnection -ComputerName <公网IP> -Port $XRAY_PUBLIC_PORT"
 echo "  # 或"
-echo "  telnet <公网IP> $XRAY_PORT"
+echo "  telnet <公网IP> $XRAY_PUBLIC_PORT"
 echo "  # Linux/macOS"
-echo "  nc -vz <公网IP> $XRAY_PORT"
-echo "  curl -v telnet://<公网IP>:$XRAY_PORT"
+echo "  nc -vz <公网IP> $XRAY_PUBLIC_PORT"
+echo "  curl -v telnet://<公网IP>:$XRAY_PUBLIC_PORT"
 echo ""
 echo "若本机监听正常，但你电脑 Test-NetConnection 失败 = 100% 是"
 echo "  云安全组 / 运营商防火墙 / LXC·LXD 端口未映射 问题，"
@@ -3251,26 +3281,13 @@ echo ""
 
 # 总结
 echo "=========================================="
-echo "📊
-# Extra: Reality port vs SOCKS port misconception
-echo "=========================================="
-echo "Reality port vs other inbound ports"
-echo "=========================================="
-echo "Inside-container listening only proves local process bind."
-echo "On LXD/NAT, each TCP port usually needs its own:"
-echo "  - cloud security group rule"
-echo "  - lxc proxy / iptables DNAT / panel port map"
-echo "So TCP 52300 reachable does NOT imply TCP <SOCKS_PORT> reachable."
-echo "From your PC compare:"
-echo "  Test-NetConnection IP -Port 52300"
-echo "  Test-NetConnection IP -Port <SOCKS_PORT>"
-echo ""
-诊断汇总"
+echo "📊 诊断汇总"
+echo "Reality 与 SOCKS5 是独立端口，需要分别配置安全组和 NAT 映射。"
 echo "=========================================="
 echo "通过: $SCORE_OK   警告: $SCORE_WARN   严重: $SCORE_BAD"
 echo ""
 echo "延迟 -1ms 最常见根因排序:"
-echo "  1. 云安全组未放行 TCP $XRAY_PORT"
+echo "  1. 云安全组未放行公网 TCP $XRAY_PUBLIC_PORT"
 echo "  2. LXC/LXD NAT 未做端口映射到容器"
 echo "  3. 客户端填了内网 IP，或 PublicKey/UUID/ShortId/SNI 不一致"
 echo "  4. 新版 Xray 把 Password 当 PublicKey；误填 Hash32 会失败"
@@ -3284,7 +3301,7 @@ echo "  # 看日志"
 echo "  tail -n 100 $XRAY_LOG"
 echo "  journalctl -u xray.service -n 80 --no-pager"
 echo "  # Debian LXD 端口映射示例"
-echo "  lxc config device add <实例> xrayproxy proxy listen=tcp:0.0.0.0:$XRAY_PORT connect=tcp:127.0.0.1:$XRAY_PORT"
+echo "  lxc config device add <实例> xrayproxy proxy listen=tcp:0.0.0.0:$XRAY_PUBLIC_PORT connect=tcp:127.0.0.1:$XRAY_PORT"
 echo "  # 返回管理菜单，选择 4 重新诊断；订阅问题选择 2 或 3"
 echo ""
 if [ "$SCORE_BAD" -gt 0 ]; then
@@ -3348,6 +3365,20 @@ manager_install() {
             *) echo "已取消安装。"; return 0 ;;
         esac
     fi
+    if [ -t 9 ]; then
+        PORT=$(manager_read_default 'Reality 容器监听端口' "$PORT") || return 1
+        NODE_PUBLIC_PORT=$(manager_read_default 'Reality NAT 公网端口' "${NODE_PUBLIC_PORT:-$PORT}") || return 1
+        CLASH_SUB_PORT=$(manager_read_default '订阅容器监听端口' "$CLASH_SUB_PORT") || return 1
+        CLASH_SUB_PUBLIC_PORT=$(manager_read_default '订阅 NAT 公网端口' "${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT}") || return 1
+    fi
+    NODE_PUBLIC_PORT="${NODE_PUBLIC_PORT:-$PORT}"
+    CLASH_SUB_PUBLIC_PORT="${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT}"
+    for manager_port in "$PORT" "$NODE_PUBLIC_PORT" "$CLASH_SUB_PORT" "$CLASH_SUB_PUBLIC_PORT"; do
+        validate_port "$manager_port" || error_exit "端口必须在 1–65535 之间"
+        case "$manager_port" in 0*) error_exit "端口不能带前导零" ;; esac
+    done
+    [ "$PORT" != "$CLASH_SUB_PORT" ] || error_exit "Reality 与订阅容器监听端口不能相同"
+    [ "$NODE_PUBLIC_PORT" != "$CLASH_SUB_PUBLIC_PORT" ] || error_exit "Reality 与订阅公网端口不能相同"
     case "$XRAY_PLATFORM" in
         alpine) install_alpine ;;
         debian) install_debian ;;
@@ -3391,6 +3422,404 @@ manager_logs() {
     fi
 }
 
+# 配置编辑只读取数据文件；所有候选文件先写入私有临时目录。
+manager_config_stage() {
+    python3 - "$XRAY_CONFIG" "$config_tmp" <<'PY'
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import sys
+import uuid
+from urllib.parse import urlencode
+
+def port(value):
+    if not re.fullmatch(r'[0-9]{1,5}', str(value)) or not 1 <= int(value) <= 65535:
+        raise ValueError('端口必须为 1–65535 的整数')
+    return int(value)
+
+def domain(value):
+    if len(value) > 253 or '.' not in value or not all(re.fullmatch(
+            r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', v) for v in value.split('.')):
+        raise ValueError('请填写完整域名，不带协议、端口、路径或通配符')
+    return value.lower()
+
+try:
+    config = json.loads(Path(sys.argv[1]).read_text())
+    folder = Path(sys.argv[2])
+    values = {k: os.environ.get(k, '') for k in (
+        'PORT', 'NODE_PUBLIC_PORT', 'CLEAR_IP', 'USER_UUID', 'SNI', 'SHORT_ID', 'PUB_KEY',
+        'CLASH_SUB_PORT', 'CLASH_SUB_PUBLIC_PORT', 'CLASH_SUB_TOKEN', 'CLASH_SUB_HOST',
+        'CLASH_SUB_TLS_CERT', 'CLASH_SUB_TLS_KEY')}
+    nodes = [v for v in config.get('inbounds', []) if v.get('protocol') == 'vless'
+             and v.get('streamSettings', {}).get('security') == 'reality'
+             and any(c.get('id') == values['USER_UUID'] for c in v.get('settings', {}).get('clients', []))]
+    if len(nodes) != 1:
+        raise ValueError('找不到唯一匹配的 Reality 入站，停止修改')
+    node = nodes[0]
+    client = next(c for c in node['settings']['clients'] if c['id'] == values['USER_UUID'])
+    reality = node['streamSettings']['realitySettings']
+    kind = os.environ['EDIT_KIND']
+    value, extra, secret = (os.environ.get(k, '') for k in ('EDIT_VALUE', 'EDIT_EXTRA', 'EDIT_SECRET'))
+    if kind == '1':
+        node['port'] = port(value)
+        values['NODE_PUBLIC_PORT'] = str(port(extra))
+    elif kind == '2':
+        values['CLASH_SUB_PORT'] = str(port(value))
+        values['CLASH_SUB_PUBLIC_PORT'] = str(port(extra))
+    elif kind == '3':
+        address = ipaddress.ip_address(value)
+        if address.version != 4 or address.is_unspecified or address.is_multicast or address.is_loopback:
+            raise ValueError('当前模板需要可供客户端访问的公网 IPv4 地址')
+        values['CLEAR_IP'] = str(address)
+    elif kind == '4':
+        values['SNI'] = domain(value)
+        reality['serverNames'] = [values['SNI']]
+        reality['dest'] = values['SNI']+':443'
+        reality.pop('target', None)
+    elif kind == '5':
+        values['USER_UUID'] = str(uuid.UUID(value))
+        client['id'] = values['USER_UUID']
+    elif kind == '6':
+        if not re.fullmatch(r'(?:[0-9a-fA-F]{2}){1,8}', value):
+            raise ValueError('ShortId 须为 2–16 位、偶数长度的十六进制字符')
+        values['SHORT_ID'] = value.lower()
+        reality['shortIds'] = ['', values['SHORT_ID']]
+    elif kind == '7':
+        socks = [v for v in config['inbounds'] if v.get('protocol') == 'socks']
+        if len(socks) > 1:
+            raise ValueError('存在多个 SOCKS 入站，请先手动确认要管理的入站')
+        if value == 'off':
+            config['inbounds'] = [v for v in config['inbounds'] if v.get('protocol') != 'socks']
+        else:
+            if not re.fullmatch(r'[A-Za-z0-9._@+-]{1,64}', extra):
+                raise ValueError('SOCKS 用户名须为 1–64 位字母、数字或 ._@+-')
+            if not secret or any(c in secret for c in '\r\n\0'):
+                raise ValueError('SOCKS 密码不能为空或包含换行、NUL')
+            inbound = socks[0] if socks else {'tag': 'socks-in', 'listen': '0.0.0.0', 'protocol': 'socks'}
+            inbound['port'] = port(value)
+            inbound['settings'] = {'auth': 'password', 'accounts': [{'user': extra, 'pass': secret}], 'udp': True}
+            if not socks:
+                config['inbounds'].append(inbound)
+    elif kind == '8':
+        if value not in ('debug', 'info', 'warning', 'error', 'none'):
+            raise ValueError('日志级别须为 debug / info / warning / error / none')
+        config.setdefault('log', {})['loglevel'] = value
+    elif kind == '9':
+        import secrets
+        values['CLASH_SUB_TOKEN'] = secrets.token_hex(16)
+    else:
+        raise ValueError('未知修改项目')
+    values['PORT'] = str(port(node['port']))
+    values['NODE_PUBLIC_PORT'] = str(port(values['NODE_PUBLIC_PORT']))
+    values['CLASH_SUB_PORT'] = str(port(values['CLASH_SUB_PORT']))
+    values['CLASH_SUB_PUBLIC_PORT'] = str(port(values['CLASH_SUB_PUBLIC_PORT'] or values['CLASH_SUB_PORT']))
+    if values['CLASH_SUB_HOST']:
+        values['CLASH_SUB_HOST'] = domain(values['CLASH_SUB_HOST'])
+    ports = [port(v['port']) for v in config['inbounds'] if 'port' in v]
+    ports.append(int(values['CLASH_SUB_PORT']))
+    if len(set(ports)) != len(ports):
+        raise ValueError('Reality、订阅和其他入站的容器监听端口不能重复')
+    original = json.loads(Path(sys.argv[1]).read_text())
+    old_ports = {port(v['port']) for v in original['inbounds'] if 'port' in v}
+    old_ports.add(port(os.environ['CLASH_SUB_PORT']))
+    import socket
+    for number in set(ports) - old_ports:
+        try:
+            with socket.socket() as probe:
+                probe.bind(('0.0.0.0', number))
+        except OSError:
+            raise ValueError('新监听端口已被占用或无法绑定：'+str(number))
+    # NAT forwards both public TCP ports to one public IP, so these must differ too.
+    if values['NODE_PUBLIC_PORT'] == values['CLASH_SUB_PUBLIC_PORT']:
+        raise ValueError('Reality 与订阅公网 TCP 端口不能相同')
+    params = dict(encryption='none', flow='xtls-rprx-vision', security='reality',
+                  sni=values['SNI'], fp='chrome', pbk=values['PUB_KEY'], sid=values['SHORT_ID'], type='tcp')
+    values['SHARE_LINK'] = ('vless://'+values['USER_UUID']+'@'+values['CLEAR_IP']+':'+values['NODE_PUBLIC_PORT']
+                            +'?'+urlencode(params)+'#Reality-'+values['NODE_PUBLIC_PORT'])
+    summary = ('地址 (Address): {CLEAR_IP}\n容器监听端口: {PORT}\n公网端口 (Port): {NODE_PUBLIC_PORT}\n'
+               '用户 ID (UUID): {USER_UUID}\n流控 (Flow): xtls-rprx-vision\n传输安全: reality\n'
+               'SNI: {SNI}\n公钥 (PublicKey / pbk): {PUB_KEY}\nShortID (sid): {SHORT_ID}\n'
+               'Fingerprint: chrome\n网络: tcp\n\n分享链接:\n{SHARE_LINK}\n').format(**values)
+    for inbound in config['inbounds']:
+        if inbound.get('protocol') == 'socks':
+            summary += '\nSOCKS5 容器监听端口: '+str(inbound['port'])+'\n'
+            for account in inbound.get('settings', {}).get('accounts', []):
+                summary += 'SOCKS5 用户名: '+account.get('user', '')+'\nSOCKS5 密码: '+account.get('pass', '')+'\n'
+    (folder/'config.json').write_text(json.dumps(config, ensure_ascii=False, indent=4)+'\n')
+    (folder/'client-link.txt').write_text(summary)
+    (folder/'changes.env').write_text(''.join(k+'='+shlex.quote(str(v))+'\n' for k,v in values.items()))
+except (OSError, ValueError, KeyError, StopIteration) as error:
+    sys.exit('配置校验失败：'+str(error))
+PY
+}
+
+manager_read_default() {
+    manager_value=$(manager_read "$1 [$2]: ") || return 1
+    printf '%s' "${manager_value:-$2}"
+}
+
+manager_read_secret() (
+    if [ -t 9 ]; then
+        manager_stty=$(stty -g <&9) || exit 1
+        trap 'stty "$manager_stty" <&9' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        stty -echo <&9 || exit 1
+    fi
+    manager_read "$1"
+    manager_secret_status=$?
+    printf '\n' >&2
+    exit "$manager_secret_status"
+)
+
+manager_restart_xray() {
+    if [ "$XRAY_PLATFORM" = alpine ]; then
+        sh /etc/local.d/xray.stop
+        sh /etc/local.d/xray.start
+    else
+        systemctl restart xray.service
+        systemctl is-active --quiet xray.service
+    fi
+}
+
+manager_check_listeners() {
+    python3 - "$XRAY_CONFIG" <<'PY'
+import json
+import socket
+import sys
+import time
+config = json.load(open(sys.argv[1]))
+for inbound in config['inbounds']:
+    if inbound.get('protocol') not in ('vless', 'socks'):
+        continue
+    host = inbound.get('listen', '0.0.0.0')
+    host = '127.0.0.1' if host == '0.0.0.0' else '::1' if host == '::' else host
+    for attempt in range(10):
+        try:
+            with socket.create_connection((host, int(inbound['port'])), timeout=1):
+                break
+        except OSError:
+            if attempt == 9:
+                sys.exit('Xray 新配置未能监听 TCP '+str(inbound['port']))
+            time.sleep(0.3)
+PY
+}
+
+manager_config_finish() {
+    config_status=$?
+    trap - EXIT INT TERM
+    if [ "$config_committed" = 1 ] && [ "$config_success" = 0 ]; then
+        echo "新配置未通过启动或自检，正在恢复原配置。" >&2
+        for config_name in config.json client-link.txt clash-meta.yaml xray-client.json v2rayn.txt clash-sub.env; do
+            if [ -f "$config_backup/$config_name" ]; then
+                cp -p "$config_backup/$config_name" "$XRAY_DIR/$config_name" || echo "恢复失败：$config_name" >&2
+            else
+                rm -f -- "$XRAY_DIR/$config_name"
+            fi
+        done
+        ( manager_restart_xray ) || echo "原 Xray 服务重启失败，请查看日志；备份：$config_backup" >&2
+        ( start_clash_sub_service ) || echo "原订阅服务重启失败，请查看日志；备份：$config_backup" >&2
+    fi
+    [ -z "$config_tmp" ] || rm -rf -- "$config_tmp"
+    rmdir "$XRAY_DIR/.manager-config-lock" 2>/dev/null || true
+    exit "$config_status"
+}
+
+manager_edit_config() (
+    set -eu
+    umask 077
+    manager_require_platform
+    [ -f "$XRAY_CONFIG" ] && [ -f "$SHARE_FILE" ] || error_exit "请先选择主菜单 1 安装"
+    command -v python3 >/dev/null || error_exit "缺少 python3"
+    mkdir "$XRAY_DIR/.manager-config-lock" 2>/dev/null || error_exit "另一个配置修改正在进行；请稍后重试"
+    config_tmp=''
+    config_backup=''
+    config_committed=0
+    config_success=0
+    trap manager_config_finish EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    config_tmp=$(mktemp -d)
+    SUB_ENV="$XRAY_DIR/clash-sub.env"
+    load_node_settings > "$config_tmp/current.env"
+    . "$config_tmp/current.env"
+    EDIT_KIND="$1"
+    EDIT_VALUE=''
+    EDIT_EXTRA=''
+    EDIT_SECRET=''
+    case "$EDIT_KIND" in
+        1)
+            EDIT_VALUE=$(manager_read_default 'Reality 容器监听端口' "$PORT") || exit 1
+            EDIT_EXTRA=$(manager_read_default 'Reality NAT 公网端口（客户端连接端口）' "$NODE_PUBLIC_PORT") || exit 1 ;;
+        2)
+            EDIT_VALUE=$(manager_read_default '订阅容器监听端口' "$CLASH_SUB_PORT") || exit 1
+            EDIT_EXTRA=$(manager_read_default '订阅 NAT 公网端口' "${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT}") || exit 1 ;;
+        3) EDIT_VALUE=$(manager_read_default '客户端连接的公网 IPv4' "$CLEAR_IP") || exit 1 ;;
+        4) EDIT_VALUE=$(manager_read_default 'Reality SNI（dest 将同步设为该域名:443）' "$SNI") || exit 1 ;;
+        5) EDIT_VALUE=$(manager_read_default '新 UUID（输入 new 自动生成）' "$USER_UUID") || exit 1
+           [ "$EDIT_VALUE" != new ] || EDIT_VALUE=$(python3 -c 'import uuid; print(uuid.uuid4())') ;;
+        6) EDIT_VALUE=$(manager_read_default 'ShortId（2–16 位偶数长度十六进制）' "$SHORT_ID") || exit 1 ;;
+        7)
+            EDIT_VALUE=$(manager_read 'SOCKS5：输入 off 关闭，或输入监听端口以启用 / 修改: ') || exit 1
+            if [ "$EDIT_VALUE" != off ]; then
+                EDIT_EXTRA=$(manager_read 'SOCKS5 用户名: ') || exit 1
+                EDIT_SECRET=$(manager_read_secret 'SOCKS5 密码（隐藏输入）: ') || exit 1
+            fi ;;
+        8) EDIT_VALUE=$(manager_read_default '日志级别 debug/info/warning/error/none' "$XRAY_LOG_LEVEL") || exit 1 ;;
+        9) echo "将生成新订阅口令。旧订阅 URL 会失效，请在客户端替换地址。" ;;
+        *) error_exit "未知配置项" ;;
+    esac
+    export EDIT_KIND EDIT_VALUE EDIT_EXTRA EDIT_SECRET
+    export PORT NODE_PUBLIC_PORT CLEAR_IP USER_UUID SNI SHORT_ID PUB_KEY
+    export CLASH_SUB_PORT CLASH_SUB_PUBLIC_PORT CLASH_SUB_TOKEN CLASH_SUB_HOST CLASH_SUB_TLS_CERT CLASH_SUB_TLS_KEY
+    manager_config_stage
+    . "$config_tmp/changes.env"
+    printf '即将应用：Reality 公网 %s:%s → 容器 TCP %s\n' "$CLEAR_IP" "$NODE_PUBLIC_PORT" "$PORT"
+    printf '订阅公网端口 %s → 容器 TCP %s；SNI：%s\n' "$CLASH_SUB_PUBLIC_PORT" "$CLASH_SUB_PORT" "$SNI"
+    printf 'UUID：%s；ShortId：%s\n' "$USER_UUID" "$SHORT_ID"
+    subscription_validate_options
+    if [ -n "$CLASH_SUB_TLS_CERT$CLASH_SUB_TLS_KEY" ]; then
+        subscription_validate_tls || error_exit "现有 HTTPS 证书未通过校验，请先修复证书"
+    fi
+    [ "$EDIT_KIND" != 4 ] || assert_sni_usable "$SNI"
+    "$XRAY_BIN" run -test -c "$config_tmp/config.json" </dev/null > "$config_tmp/xray-check.log" 2>&1 || {
+        cat "$config_tmp/xray-check.log" >&2
+        error_exit "Xray 配置测试失败，原配置未修改"
+    }
+    # Temporarily redirect outputs, retaining live paths inside the subscription env.
+    (
+        CLASH_FILE="$config_tmp/clash-meta.yaml"
+        XRAY_CLIENT_FILE="$config_tmp/xray-client.json"
+        V2RAYN_SUB_FILE="$config_tmp/v2rayn.txt"
+        SHARE_FILE="$config_tmp/client-link.txt"
+        SUB_ENV="$config_tmp/clash-sub.env"
+        SUBSCRIPTION_LIVE_CLASH_FILE="$XRAY_DIR/clash-meta.yaml"
+        SUBSCRIPTION_LIVE_V2RAYN_FILE="$XRAY_DIR/v2rayn.txt"
+        write_client_routing_files
+    ) > "$config_tmp/generated.log"
+    config_confirm=$(manager_read '保存并应用以上修改？输入 y 确认，其他输入取消: ') || exit 1
+    case "$config_confirm" in y|Y) ;; *) echo "已取消，原配置未修改。"; exit 0 ;; esac
+    config_backup="$XRAY_DIR/config-backup-$(date +%Y%m%d-%H%M%S)-$$"
+    mkdir -m 700 "$config_backup"
+    for config_name in config.json client-link.txt clash-meta.yaml xray-client.json v2rayn.txt clash-sub.env; do
+        [ ! -f "$XRAY_DIR/$config_name" ] || cp -p "$XRAY_DIR/$config_name" "$config_backup/$config_name"
+    done
+    config_committed=1
+    for config_name in config.json client-link.txt clash-meta.yaml xray-client.json v2rayn.txt clash-sub.env; do
+        cp "$config_tmp/$config_name" "$XRAY_DIR/$config_name"
+        chmod 600 "$XRAY_DIR/$config_name"
+    done
+    open_firewall_port "$PORT"
+    open_firewall_port "$CLASH_SUB_PORT"
+    if [ "$EDIT_KIND" = 7 ] && [ "$EDIT_VALUE" != off ]; then
+        open_firewall_port "$EDIT_VALUE"
+    fi
+    manager_restart_xray
+    manager_check_listeners
+    start_clash_sub_service
+    subscription_verify_local
+    config_success=1
+    echo "✅ 修改已应用。原配置备份：$config_backup"
+    echo "请同步修改宿主机 NAT 映射和云安全组："
+    echo "  Reality 公网 TCP $NODE_PUBLIC_PORT → 容器 TCP $PORT"
+    echo "  订阅公网 TCP ${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT} → 容器 TCP $CLASH_SUB_PORT"
+    echo "客户端请更新订阅；使用手动分享链接时，重新导入主菜单 7 中的新链接。"
+    cat "$SHARE_FILE"
+)
+
+manager_edit_https() (
+    set -eu
+    umask 077
+    manager_require_platform
+    [ -f "$XRAY_CONFIG" ] && [ -f "$SHARE_FILE" ] || error_exit "请先选择主菜单 1 安装"
+    mkdir "$XRAY_DIR/.manager-config-lock" 2>/dev/null || error_exit "另一个配置修改正在进行；请稍后重试"
+    config_tmp=''
+    config_backup=''
+    config_committed=0
+    config_success=0
+    trap manager_config_finish EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    config_tmp=$(mktemp -d)
+    SUB_ENV="$XRAY_DIR/clash-sub.env"
+    load_node_settings > "$config_tmp/current.env"
+    . "$config_tmp/current.env"
+    echo "订阅访问方式：1) Cloudflare 自动 HTTPS / 续期 2) 已有公开证书 3) 保留当前方式，仅改域名"
+    config_https_mode=$(manager_read '请选择 [1–3]: ') || exit 1
+    CLASH_SUB_HOST=$(manager_read_default '完整订阅域名' "$CLASH_SUB_HOST") || exit 1
+    case "$config_https_mode" in
+        1) CLASH_SUB_HTTPS=cloudflare ;;
+        2)
+            CLASH_SUB_HTTPS=existing
+            CLASH_SUB_TLS_CERT=$(manager_read_default 'PEM 完整证书链路径' "${CLASH_SUB_TLS_CERT:-/etc/xray/tls/fullchain.pem}") || exit 1
+            CLASH_SUB_TLS_KEY=$(manager_read_default 'PEM 私钥路径' "${CLASH_SUB_TLS_KEY:-/etc/xray/tls/key.pem}") || exit 1 ;;
+        3)
+            if [ -n "$CLASH_SUB_TLS_CERT$CLASH_SUB_TLS_KEY" ]; then
+                CLASH_SUB_HTTPS=existing
+            else
+                CLASH_SUB_HTTPS=off
+            fi ;;
+        *) error_exit "无效选项" ;;
+    esac
+    config_confirm=$(manager_read '应用订阅域名 / HTTPS 修改？输入 y 确认，其他输入取消: ') || exit 1
+    case "$config_confirm" in y|Y) ;; *) echo "已取消。"; exit 0 ;; esac
+    config_backup="$XRAY_DIR/config-backup-$(date +%Y%m%d-%H%M%S)-$$"
+    mkdir -m 700 "$config_backup"
+    for config_name in config.json client-link.txt clash-meta.yaml xray-client.json v2rayn.txt clash-sub.env; do
+        [ ! -f "$XRAY_DIR/$config_name" ] || cp -p "$XRAY_DIR/$config_name" "$config_backup/$config_name"
+    done
+    export CLASH_SUB_HOST CLASH_SUB_HTTPS CLASH_SUB_TLS_CERT CLASH_SUB_TLS_KEY
+    config_committed=1
+    update_subscription
+    config_success=1
+    echo "✅ 订阅设置已更新。原配置备份：$config_backup"
+)
+
+manager_config_summary() (
+    set -eu
+    config_summary=$(load_node_settings) || exit 1
+    eval "$config_summary"
+    printf '\n当前 Reality：公网 %s:%s → 容器 TCP %s\n' "$CLEAR_IP" "$NODE_PUBLIC_PORT" "$PORT"
+    printf '当前订阅：%s，公网端口 %s → 容器 TCP %s\n' "${CLASH_SUB_HOST:-$CLEAR_IP}" "${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT}" "$CLASH_SUB_PORT"
+    printf '当前 SNI：%s；Xray 日志级别：%s\n' "$SNI" "$XRAY_LOG_LEVEL"
+)
+
+manager_config_menu() {
+    manager_require_platform
+    [ -f "$XRAY_CONFIG" ] && [ -f "$SHARE_FILE" ] || error_exit "请先选择主菜单 1 安装"
+    while :; do
+        manager_config_summary
+        cat <<'CONFIG_MENU'
+
+========== 修改配置 ==========
+  1. Reality 容器监听端口 / NAT 公网端口
+  2. 订阅容器监听端口 / NAT 公网端口
+  3. 节点公网 IPv4 地址
+  4. Reality SNI / 伪装目标
+  5. 节点 UUID
+  6. Reality ShortId
+  7. SOCKS5 开关 / 端口 / 用户名 / 密码
+  8. Xray 日志级别
+  9. 重置订阅访问口令
+ 10. 订阅域名 / HTTPS / 证书
+  0. 返回主菜单
+CONFIG_MENU
+        config_choice=$(manager_read '请选择 [0–10]: ') || return 0
+        case "$config_choice" in
+            0) return 0 ;;
+            [1-9]) manager_edit_config "$config_choice"; config_result=$? ;;
+            10) manager_edit_https; config_result=$? ;;
+            *) echo "无效选项，请输入 0–10。"; continue ;;
+        esac
+        if [ "$config_result" -ne 0 ]; then
+            echo "修改未完成（退出码 $config_result），请查看上方提示。"
+        fi
+    done
+}
+
 manager_dispatch() (
     set -eu
     umask 077
@@ -3416,7 +3845,8 @@ manager_dispatch() (
         7) manager_show_client ;;
         8) manager_restart ;;
         9) manager_logs ;;
-        *) error_exit "无效选项，请选择 0–9" ;;
+        10) set +e; manager_config_menu ;;
+        *) error_exit "无效选项，请选择 0–10" ;;
     esac
 )
 
@@ -3435,6 +3865,7 @@ manager_menu() {
   7. 查看节点参数与订阅地址
   8. 重启 Xray 和订阅服务
   9. 查看最近日志
+ 10. 修改配置（端口 / NAT / 节点 / SOCKS5 / HTTPS）
   0. 退出
 MENU
 }
@@ -3442,14 +3873,14 @@ MENU
 manager_main() {
     case "${1:-}" in
         --help|-h)
-            echo "用法：sh xray.sh [0–9]"
+            echo "用法：sh xray.sh [0–10]"
             echo "无参数进入菜单；也可直接指定菜单编号。Alpine 与 Debian 使用同一个文件。"
             manager_menu
             return 0 ;;
     esac
     [ "$#" -le 1 ] || { echo "只接受一个菜单编号；使用 --help 查看帮助" >&2; return 1; }
     case "${1:-}" in
-        ''|[0-9]) ;;
+        ''|[0-9]|10) ;;
         *) echo "无效选项；使用 sh xray.sh --help 查看帮助" >&2; return 1 ;;
     esac
     # 终端优先；无终端时支持从 stdin 读取编号，EOF 正常退出。
@@ -3465,16 +3896,16 @@ manager_main() {
     fi
     while :; do
         manager_menu
-        manager_choice=$(manager_read '请选择 [0–9]: ') || break
+        manager_choice=$(manager_read '请选择 [0–10]: ') || break
         case "$manager_choice" in
             0) break ;;
-            [1-9])
+            [1-9]|10)
                 manager_dispatch "$manager_choice"
                 manager_result=$?
                 if [ "$manager_result" -ne 0 ]; then
                     echo "操作未完成（退出码 $manager_result），请查看上方提示。"
                 fi ;;
-            *) echo "无效选项，请输入 0–9。" ;;
+            *) echo "无效选项，请输入 0–10。" ;;
         esac
     done
 }
