@@ -1,28 +1,21 @@
-#!/bin/bash
-# ------------------------------------------------------------
-# curl|bash 防护：stdin 被管道喂脚本时，先整份落盘再 exec
-# 否则 xray/openssl/jq 等一旦读 stdin，会吃掉后续脚本，
-# 表现为卡在「正在生成配置文件...」(heredoc 永远等不到结束标记)
-# ------------------------------------------------------------
-if [ -z "${XRAY_SCRIPT_REEXEC:-}" ] && [ ! -f "$0" ]; then
-    _xray_tmp="$(mktemp /tmp/xray-install-XXXXXX.sh 2>/dev/null || mktemp)"
-    cat > "$_xray_tmp"
-    chmod +x "$_xray_tmp"
-    XRAY_SCRIPT_REEXEC=1 exec bash "$_xray_tmp" "$@"
+#!/bin/sh
+# Xray Reality 管理：Alpine/OpenRC 与 Debian/systemd 共用一个入口。
+# 将管道输入完整落盘后再读取菜单，避免交互命令吞掉脚本内容。
+if [ ! -f "$0" ]; then
+    (
+        umask 077
+        manager_tmp=$(mktemp /tmp/xray-manager-XXXXXX) || exit 1
+        trap 'rm -f -- "$manager_tmp"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        cat > "$manager_tmp" || exit 1
+        sh "$manager_tmp" "$@"
+    )
+    exit $?
 fi
 
-
-# ====================================================
-# Project: Debian LXD Xray Reality One-Click Script
-# Platform: Debian trixie amd64 (20251224_0350)
-# Features: Enhanced error handling, systemd, firewall, connectivity checks
-# ====================================================
-
-set -e  # 错误时立即退出，避免继续执行
-set -u  # 未定义变量时报错
-
 # 0. 自定义基础变量
-PORT=52300
+PORT="${PORT:-52300}"
 CLASH_SUB_PORT="${CLASH_SUB_PORT:-58472}"   # Clash / v2rayN 订阅端口
 CLASH_SUB_HTTPS="${CLASH_SUB_HTTPS:-auto}" # auto/cloudflare/existing/import/off
 CLASH_SUB_PUBLIC_PORT="${CLASH_SUB_PUBLIC_PORT:-}" # NAT 外部端口，默认等于监听端口
@@ -38,61 +31,57 @@ SOCKS_USER_ESC=""
 SOCKS_PASS_ESC=""
 SOCKS_INFO_TEXT=""
 SHORT_ID="0123456789abcdef"
+DEST_SITE=""
+SNI=""
+# 多地域 Reality 伪装目标候选（美国/欧洲/印度/俄罗斯/亚太）
+# 每行: domain|region
+SNI_CANDIDATES="
+www.microsoft.com|US
+www.apple.com|US
+www.cloudflare.com|US
+www.amazon.com|US
+www.nvidia.com|US
+www.intel.com|US
+www.adobe.com|US
+www.costco.com|US
+www.ikea.com|EU
+www.sap.com|EU
+www.nokia.com|EU
+www.ericsson.com|EU
+www.bmw.com|EU
+www.dyson.co.uk|EU
+www.sony.co.jp|EU
+www.volkswagen.com|EU
+www.infosys.com|IN
+www.tcs.com|IN
+www.airtel.in|IN
+www.flipkart.com|IN
+www.india.gov.in|IN
+www.yandex.ru|RU
+www.vk.com|RU
+www.mail.ru|RU
+www.sberbank.ru|RU
+www.wildberries.ru|RU
+www.samsung.com|APAC
+www.shopee.sg|APAC
+www.toyota.com|APAC
+www.singaporeair.com|APAC
+"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/etc/xray/config.json"
 XRAY_DIR="/etc/xray"
-XRAY_USER="xray"
-XRAY_GROUP="xray"
 XRAY_LOG="/var/log/xray.log"
 SHARE_FILE="/etc/xray/client-link.txt"
 
 CLASH_FILE="/etc/xray/clash-meta.yaml"
 XRAY_CLIENT_FILE="/etc/xray/xray-client.json"
-CLIENT_NODE_NAME="Debian-Reality"
+CLIENT_NODE_NAME="Reality"
+XRAY_USER="xray"
+XRAY_GROUP="xray"
 CLASH_SUB_URL=""
 V2RAYN_SUB_URL=""
 V2RAYN_SUB_FILE="/etc/xray/v2rayn.txt"
-CLASH_SUB_TOKEN=""
-
-# SNI 候选列表（多地域：美国/欧洲/印度/俄罗斯/亚太）
-# REALITY: 安装期强制校验 DNS/TCP443/HTTPS/TLS1.3，失败则中止
-SNI_CANDIDATES=(
-    # 美国 / 北美
-    "www.microsoft.com"
-    "www.apple.com"
-    "www.cloudflare.com"
-    "www.amazon.com"
-    "www.nvidia.com"
-    "www.intel.com"
-    "www.adobe.com"
-    "www.costco.com"
-    # 欧洲
-    "www.ikea.com"
-    "www.sap.com"
-    "www.nokia.com"
-    "www.ericsson.com"
-    "www.bmw.com"
-    "www.dyson.co.uk"
-    "www.sony.co.jp"
-    "www.volkswagen.com"
-    # 印度
-    "www.infosys.com"
-    "www.tcs.com"
-    "www.airtel.in"
-    "www.flipkart.com"
-    "www.india.gov.in"
-    # 俄罗斯
-    "www.yandex.ru"
-    "www.vk.com"
-    "www.mail.ru"
-    "www.sberbank.ru"
-    "www.wildberries.ru"
-    # 亚太兜底
-    "www.samsung.com"
-    "www.shopee.sg"
-    "www.toyota.com"
-    "www.singaporeair.com"
-)
+CLASH_SUB_TOKEN="${CLASH_SUB_TOKEN:-}"
 
 # 错误处理函数
 error_exit() {
@@ -107,54 +96,64 @@ run_cmd() {
     fi
 }
 
+# 从 x25519 输出中提取密钥（兼容 BusyBox / 多版本 Xray 输出）
+# 支持:
+#   PrivateKey: / PublicKey:
+#   PrivateKey: / Password:            (Password = Reality 客户端公钥)
+#   Password (PublicKey):
+#   Private key: / Public key:
 extract_key_value() {
     label="$1"
     text="$2"
     echo "$text" | sed -n "s/.*${label}:[[:space:]]*\\([^[:space:]]*\\).*/\\1/p" | head -n 1
 }
 
-# 兼容多版本 x25519 输出；新版 Password 字段 = 客户端 PublicKey
 extract_reality_keys() {
     text="$1"
-    local priv=""
-    local pub=""
+    priv=""
+    pub=""
 
     priv=$(extract_key_value "PrivateKey" "$text")
     [ -z "$priv" ] && priv=$(extract_key_value "Private key" "$text")
+    [ -z "$priv" ] && priv=$(extract_key_value "private key" "$text")
     [ -z "$priv" ] && priv=$(extract_key_value "privateKey" "$text")
 
+    # 新版 Xray: Password 字段就是 Reality 客户端要用的 PublicKey
     pub=$(extract_key_value "Password" "$text")
     if [ -z "$pub" ]; then
         pub=$(echo "$text" | sed -n 's/.*Password[[:space:]]*(PublicKey):[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -n 1)
     fi
     [ -z "$pub" ] && pub=$(extract_key_value "PublicKey" "$text")
     [ -z "$pub" ] && pub=$(extract_key_value "Public key" "$text")
+    [ -z "$pub" ] && pub=$(extract_key_value "public key" "$text")
     [ -z "$pub" ] && pub=$(extract_key_value "publicKey" "$text")
 
-    # 防止误把 Hash32 当公钥
+    # 绝不能把 Hash32 当成公钥
     if [ -n "$pub" ] && echo "$text" | grep -q "Hash32:[[:space:]]*$pub"; then
         pub=""
     fi
 
-    printf '%s\n%s\n' "$priv" "$pub"
+    echo "$priv"
+    echo "$pub"
 }
 
 validate_b64_key() {
-    local key="$1"
-    local name="$2"
-    local len
+    # Reality x25519 key 一般是 43~44 字符的 URL-safe base64
+    key="$1"
+    name="$2"
     len=$(printf %s "$key" | wc -c | tr -d ' ')
     if [ "$len" -lt 40 ] || [ "$len" -gt 64 ]; then
-        error_exit "$name 长度异常($len)，x25519 解析可能失败"
+        error_exit "$name 长度异常($len)，原始 x25519 输出可能解析失败"
     fi
-    if [[ ! "$key" =~ ^[A-Za-z0-9+/=_-]+$ ]]; then
-        error_exit "$name 含非法字符: $key"
-    fi
+    case "$key" in
+        *[!A-Za-z0-9+/=_-]*)
+            error_exit "$name 含非法字符，解析失败: $key"
+            ;;
+    esac
 }
 
 get_public_ip() {
-    local ip=""
-    local url
+    ip=""
     for url in \
         "https://api.ipify.org" \
         "https://ifconfig.me/ip" \
@@ -162,25 +161,25 @@ get_public_ip() {
         "https://api.ip.sb/ip"
     do
         ip=$(curl -4 -fsS --connect-timeout 5 --max-time 8 "$url" 2>/dev/null | tr -d '\n' | head -n 1 || true)
-        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "$ip"
-            return 0
-        fi
+        # 粗略校验 IPv4
+        echo "$ip" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && break
         ip=""
     done
-    ip=$(curl -fsS --connect-timeout 5 --max-time 8 "https://ifconfig.me" 2>/dev/null | tr -d '\n' | head -n 1 || true)
-    if [ -n "$ip" ]; then
-        echo "$ip"
+    if [ -z "$ip" ]; then
+        ip=$(curl -fsS --connect-timeout 5 --max-time 8 "https://ifconfig.me" 2>/dev/null | tr -d '\n' | head -n 1 || true)
+    fi
+    if [ -z "$ip" ]; then
+        echo "获取失败（NAT 环境请填宿主机公网 IP）"
     else
-        echo "获取失败（NAT/LXD 环境请填宿主机公网 IP）"
+        echo "$ip"
     fi
 }
 
 open_firewall_port() {
-    local port="$1"
-    local opened=0
+    port="$1"
     echo "正在尝试开放防火墙 TCP $port ..."
 
+    opened=0
     if command -v ufw >/dev/null 2>&1; then
         if ufw status 2>/dev/null | grep -qi "Status: active"; then
             ufw allow "${port}/tcp" >/dev/null 2>&1 && opened=1 && echo "✅ ufw 已放行 ${port}/tcp"
@@ -198,56 +197,52 @@ open_firewall_port() {
 
     if command -v iptables >/dev/null 2>&1; then
         if ! iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
-            if iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
-                opened=1
-                echo "✅ iptables 已放行 ${port}/tcp"
-            fi
+            iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null && opened=1 && echo "✅ iptables 已放行 ${port}/tcp" || true
         else
             opened=1
             echo "✅ iptables 已存在 ${port}/tcp 放行规则"
         fi
     fi
 
-    if [ "$opened" -eq 0 ]; then
-        echo "⚠️  容器内未检测到可配置防火墙（LXD 常见，通常正常）"
+    if command -v nft >/dev/null 2>&1; then
+        nft list ruleset 2>/dev/null | grep -q "dport ${port}" && opened=1 || true
     fi
-    echo "⚠️  若客户端延迟 -1ms：请检查云安全组 + LXD 代理/端口映射是否放行 TCP $port"
+
+    if [ "$opened" -eq 0 ]; then
+        echo "⚠️  容器内未检测到可配置防火墙（对 LXC 通常正常）"
+    fi
+
+    echo "⚠️  若仍是 -1ms：请同时检查【云安全组】和【宿主机 LXC/LXD 端口映射】是否放行 TCP $port"
 }
 
 urlencode() {
-    if command -v python3 >/dev/null 2>&1; then
-        printf %s "$1" | python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=""))' 2>/dev/null && return 0
-    fi
+    # 最小实现：对 Reality 分享链接中需要的字符做编码
     printf %s "$1" | sed 's/+/%2B/g; s/\//%2F/g; s/=/%3D/g'
 }
 
 
 
 # ------------------------------------------------------------
-# Reality 伪装目标（SNI/dest）严格校验
-# 必须: DNS + TCP443 + HTTPS/TLS 可建连
-# 加分: TLS1.3、HTTP/2、低延迟
-# 全部失败则安装中止，避免客户端 -1ms
+# Reality 伪装目标（SNI/dest）严格校验 - BusyBox/POSIX sh
 # ------------------------------------------------------------
 probe_sni_target() {
-    local sni="$1"
-    local region="${2:-unknown}"
-    local score=0
-    local tls13=0
-    local h2=0
-    local connect_time="9999"
-    local http_code="000"
-    local curl_out=""
+    sni="$1"
+    region="${2:-unknown}"
+    score=0
+    tls13=0
+    h2=0
+    connect_time="9999"
+    http_code="000"
+    curl_out=""
 
-    # DNS
-    if command -v getent >/dev/null 2>&1; then
-        if ! getent ahosts "$sni" >/dev/null 2>&1; then
+    if command -v nslookup >/dev/null 2>&1; then
+        if ! nslookup "$sni" >/dev/null 2>&1; then
             echo "FAIL dns region=$region sni=$sni" >&2
             return 1
         fi
         score=$((score + 10))
-    elif command -v nslookup >/dev/null 2>&1; then
-        if ! nslookup "$sni" >/dev/null 2>&1; then
+    elif command -v getent >/dev/null 2>&1; then
+        if ! getent ahosts "$sni" >/dev/null 2>&1; then
             echo "FAIL dns region=$region sni=$sni" >&2
             return 1
         fi
@@ -256,22 +251,14 @@ probe_sni_target() {
         score=$((score + 5))
     fi
 
-    # TCP 443（快速失败）
     if command -v nc >/dev/null 2>&1; then
         if ! nc -z -w 3 "$sni" 443 >/dev/null 2>&1; then
             echo "FAIL tcp443 region=$region sni=$sni" >&2
             return 1
         fi
         score=$((score + 20))
-    elif command -v timeout >/dev/null 2>&1; then
-        if ! timeout 3 bash -c "echo >/dev/tcp/${sni}/443" >/dev/null 2>&1; then
-            echo "FAIL tcp443 region=$region sni=$sni" >&2
-            return 1
-        fi
-        score=$((score + 20))
     fi
 
-    # 一次 curl 同时取 http_code + time_connect（允许 3xx/403）
     curl_out=$(curl -sS -o /dev/null -w "%{http_code} %{time_connect}" \
         --connect-timeout 3 --max-time 6 -I "https://${sni}" 2>/dev/null || echo "000 9999")
     http_code=$(echo "$curl_out" | awk '{print $1}')
@@ -282,32 +269,26 @@ probe_sni_target() {
     fi
     score=$((score + 30))
 
-    # TLS1.3（Reality 强烈建议）
     if curl -sS -o /dev/null --connect-timeout 3 --max-time 6 --tlsv1.3 -I "https://${sni}" 2>/dev/null; then
         tls13=1
         score=$((score + 30))
     fi
-
-    # HTTP/2
     if curl -sS -o /dev/null --connect-timeout 3 --max-time 6 --http2 -I "https://${sni}" 2>/dev/null; then
         h2=1
         score=$((score + 15))
     fi
 
-    # openssl TLS1.3 复检（有则加分；明确失败且 curl 也没过 tls13 则淘汰）
     if command -v openssl >/dev/null 2>&1; then
-        if timeout 5 openssl s_client -tls1_3 -connect "${sni}:443" -servername "$sni" </dev/null >/dev/null 2>&1; then
+        if openssl s_client -tls1_3 -connect "${sni}:443" -servername "$sni" </dev/null >/dev/null 2>&1; then
             score=$((score + 15))
             tls13=1
         fi
     fi
-    # TLS1.3 不作为单站硬淘汰条件（避免旧 curl/openssl 误杀），但无 TLS1.3 会大幅降低评分
     if [ "$tls13" -eq 0 ]; then
         echo "WARN weak-tls region=$region sni=$sni (no TLS1.3 detected, deprioritized)" >&2
     fi
 
-    local ms
-    ms=$(awk -v t="$connect_time" 'BEGIN{printf "%d", (t+0)*1000}')
+    ms=$(awk -v t="$connect_time" 'BEGIN{printf "%d", (t+0)*1000}' 2>/dev/null || echo 9999)
     echo "OK region=$region sni=$sni code=$http_code latency_ms=$ms tls13=$tls13 h2=$h2 score=$score" >&2
     echo "${score}|${connect_time}|${sni}|${region}|${tls13}|${h2}|${http_code}"
     return 0
@@ -330,62 +311,75 @@ detect_best_sni() {
     echo "区域覆盖: US / EU / IN / RU / APAC" >&2
     echo "" >&2
 
-    local best_sni=""
-    local best_score=-1
-    local best_latency=99999
-    local best_meta=""
-    local sni region result score latency tls13 h2 code
-    local ok_count=0
-    local fail_count=0
-    local region_hits=""
+    result_file="/tmp/sni-detect-$$.txt"
+    : > "$result_file"
+    ok_count=0
+    fail_count=0
 
-    for sni in "${SNI_CANDIDATES[@]}"; do
+    # 用 for 遍历，避免管道子 shell 丢结果；结果落临时文件
+    OLDIFS=$IFS
+    IFS='
+'
+    for line in $SNI_CANDIDATES; do
+        IFS=$OLDIFS
+        sni=$(echo "$line" | cut -d'|' -f1 | tr -d ' \n')
+        region=$(echo "$line" | cut -d'|' -f2 | tr -d ' \n')
         [ -z "$sni" ] && continue
-        region=$(sni_region_of "$sni")
-
-        if result=$(probe_sni_target "$sni" "$region"); then
+        [ -z "$region" ] && region=$(sni_region_of "$sni")
+        if out=$(probe_sni_target "$sni" "$region"); then
+            echo "$out" >> "$result_file"
             ok_count=$((ok_count + 1))
-            region_hits="${region_hits}${region} "
-            score=$(echo "$result" | cut -d'|' -f1)
-            latency=$(echo "$result" | cut -d'|' -f2)
-            tls13=$(echo "$result" | cut -d'|' -f5)
-            h2=$(echo "$result" | cut -d'|' -f6)
-            code=$(echo "$result" | cut -d'|' -f7)
-
-            if [ "$score" -gt "$best_score" ] || { [ "$score" -eq "$best_score" ] && awk -v a="$latency" -v b="$best_latency" 'BEGIN{exit !(a<b)}'; }; then
-                best_score=$score
-                best_latency=$latency
-                best_sni=$sni
-                best_meta="region=$region tls13=$tls13 h2=$h2 code=$code score=$score"
-            fi
         else
             fail_count=$((fail_count + 1))
         fi
+        IFS='
+'
     done
+    IFS=$OLDIFS
 
     echo "" >&2
     echo "检测汇总: 通过 $ok_count / 失败 $fail_count" >&2
-    if [ -n "$region_hits" ]; then
-        echo "可用区域命中: $region_hits" >&2
+
+    if [ ! -s "$result_file" ]; then
+        echo "❌ 所有候选伪装目标均未通过校验" >&2
+        echo "   无可用 SNI/dest 时 Reality 会握手失败，客户端表现为延迟 -1ms" >&2
+        rm -f "$result_file"
+        return 1
     fi
 
-    if [ -n "$best_sni" ]; then
-        local ms
-        ms=$(awk -v t="$best_latency" 'BEGIN{printf "%.0f", (t+0)*1000}')
-        echo "✅ 选定伪装目标: $best_sni  (${best_meta}, latency≈${ms}ms)" >&2
-        echo "$best_sni"
-        return 0
+    best=$(awk -F'|' '
+        BEGIN { best_score=-1; best_lat=99999; best_sni=""; best_region=""; best_tls=""; best_h2=""; }
+        {
+          score=$1+0; lat=$2+0; sni=$3; region=$4; tls=$5; h2=$6;
+          if (score>best_score || (score==best_score && lat<best_lat)) {
+            best_score=score; best_lat=lat; best_sni=sni; best_region=region; best_tls=tls; best_h2=h2;
+          }
+        }
+        END {
+          if (best_sni != "") printf "%s %d %s %s %s %s\n", best_sni, best_score, best_lat, best_region, best_tls, best_h2
+        }
+    ' "$result_file")
+    rm -f "$result_file"
+
+    if [ -z "$best" ]; then
+        echo "❌ 未能选定伪装目标" >&2
+        return 1
     fi
 
-    echo "❌ 所有候选伪装目标均未通过校验" >&2
-    echo "   无可用 SNI/dest 时 Reality 会握手失败，客户端表现为延迟 -1ms" >&2
-    echo "   请检查: VPS 出站 443、DNS、是否屏蔽国外站点" >&2
-    return 1
+    best_sni=$(echo "$best" | awk '{print $1}')
+    best_score=$(echo "$best" | awk '{print $2}')
+    best_lat=$(echo "$best" | awk '{print $3}')
+    best_region=$(echo "$best" | awk '{print $4}')
+    best_tls=$(echo "$best" | awk '{print $5}')
+    best_h2=$(echo "$best" | awk '{print $6}')
+    ms=$(awk -v t="$best_lat" 'BEGIN{printf "%.0f", (t+0)*1000}')
+    echo "✅ 选定伪装目标: $best_sni (region=$best_region score=$best_score tls13=$best_tls h2=$best_h2 latency≈${ms}ms)" >&2
+    echo "$best_sni"
+    return 0
 }
 
 assert_sni_usable() {
-    local sni="$1"
-    local region result tls13
+    sni="$1"
     region=$(sni_region_of "$sni")
     echo "正在对选定 SNI 做最终校验: $sni ($region)" >&2
     if ! result=$(probe_sni_target "$sni" "$region"); then
@@ -522,6 +516,43 @@ PY
 
 
 start_clash_sub_service() {
+    case "$XRAY_PLATFORM" in
+        alpine) start_clash_sub_alpine ;;
+        debian) start_clash_sub_debian ;;
+        *) error_exit "不支持的系统" ;;
+    esac
+}
+
+start_clash_sub_alpine() {
+    write_clash_sub_httpd
+    open_firewall_port "$CLASH_SUB_PORT"
+    cat > /etc/local.d/clash-sub.start << 'START'
+#!/bin/sh
+[ -f /etc/xray/clash-sub.env ] || exit 0
+if command -v pkill >/dev/null 2>&1; then
+    pkill -f "/usr/local/bin/xray-clash-sub.py" 2>/dev/null || true
+fi
+sleep 1
+python3 /usr/local/bin/xray-clash-sub.py >> /var/log/xray-clash-sub.log 2>&1 &
+START
+    cat > /etc/local.d/clash-sub.stop << 'STOP'
+#!/bin/sh
+if command -v pkill >/dev/null 2>&1; then
+    pkill -f "/usr/local/bin/xray-clash-sub.py" 2>/dev/null || true
+fi
+STOP
+    chmod +x /etc/local.d/clash-sub.start /etc/local.d/clash-sub.stop 2>/dev/null || true
+    sh /etc/local.d/clash-sub.stop 2>/dev/null || true
+    sh /etc/local.d/clash-sub.start 2>/dev/null || true
+    sleep 1
+    if pgrep -f "xray-clash-sub.py" >/dev/null 2>&1 || ps | grep -q "[x]ray-clash-sub.py"; then
+        echo "✅ Clash 本机订阅服务已启动 (TCP $CLASH_SUB_PORT)"
+    else
+        echo "⚠️  Clash 本机订阅服务启动失败，仍可用 $CLASH_FILE 本地导入"
+    fi
+}
+
+start_clash_sub_debian() {
     write_clash_sub_httpd
     open_firewall_port "$CLASH_SUB_PORT"
     pybin=$(command -v python3 || echo /usr/bin/python3)
@@ -1025,7 +1056,7 @@ NOTE
     fi
 }
 
-# BEGIN subscription HTTPS wizard (kept identical in both standalone installers)
+# BEGIN subscription HTTPS wizard
 subscription_prompt() {
     # Read the terminal rather than stdin, including curl | sh installations.
     sub_reply=""
@@ -1344,7 +1375,7 @@ subscription_import_certificate() {
     CLASH_SUB_TLS_KEY=$(printf '%s\n' "$sub_imported" | sed -n '3p')
     echo "✅ 已导入 $CLASH_SUB_HOST 的证书，无需重新申请。"
     echo "迁移后请将 Cloudflare 灰云 A 记录改为新 NAT 公网 IP，确认公网订阅端口映射。"
-    echo "证书备份不含续期账户/Token。请运行 bash subscription-update.sh --https，重新接入自动续期。"
+    echo "证书备份不含续期账户/Token。请运行 sh xray.sh，选择 3，重新接入自动续期。"
     echo "新节点参数和订阅口令以本机输出为准；证书导入不会恢复旧节点或旧订阅地址。"
 }
 
@@ -1380,7 +1411,7 @@ configure_subscription_https() {
             esac
         else
             CLASH_SUB_HTTPS=off
-            echo "无交互终端且未指定 HTTPS 参数：保持 HTTP。稍后可运行 bash subscription-update.sh --https。"
+            echo "无交互终端且未指定 HTTPS 参数：保持 HTTP。稍后可运行 sh xray.sh，选择 3。"
         fi
     fi
     if [ "$CLASH_SUB_HTTPS" = import ]; then
@@ -1411,7 +1442,7 @@ configure_subscription_https() {
             if [ "$CLASH_SUB_HTTPS" = cloudflare ]; then
                 CLASH_SUB_TLS_CERT=/etc/xray/tls/fullchain.pem
                 CLASH_SUB_TLS_KEY=/etc/xray/tls/key.pem
-                subscription_setup_cloudflare || error_exit "HTTPS 配置未完成，原订阅文件尚未改写。检查 Token 权限/网络后运行 bash subscription-update.sh --https 重试；不要反复重装 Xray。"
+                subscription_setup_cloudflare || error_exit "HTTPS 配置未完成，原订阅文件尚未改写。检查 Token 权限/网络后运行 sh xray.sh，选择 3 重试；不要反复重装 Xray。"
             else
                 if [ -z "$CLASH_SUB_TLS_CERT" ]; then
                     CLASH_SUB_TLS_CERT=$(subscription_prompt "完整证书链路径" /etc/xray/tls/fullchain.pem) || error_exit "请设置 CLASH_SUB_TLS_CERT"
@@ -1659,24 +1690,510 @@ configure_socks_optional() {
 
 
 
-# Certificate export exits before installation, so it cannot recreate the node.
-case "${1:-}" in
-    --export-cert)
-        [ "$#" -eq 2 ] || error_exit "用法: $0 --export-cert /root/sub-cert.p12"
-        subscription_export_certificate "$2"
-        exit $? ;;
-    --import-cert)
-        [ "$#" -eq 2 ] || error_exit "用法: $0 --import-cert /root/sub-cert.p12"
-        CLASH_SUB_HTTPS=import
-        CLASH_SUB_CERT_BUNDLE="$2" ;;
-    --help|-h)
-        echo "用法: $0 [--import-cert 备份.p12 | --export-cert 备份.p12]"
-        echo "无参数：正常安装；--import-cert：安装时复用证书；--export-cert：仅导出证书，不安装。"
-        exit 0 ;;
-    '') ;;
-    *) error_exit "未知参数，使用 --help 查看用法" ;;
-esac
 
+# Alpine 安装流程（OpenRC / apk）。
+install_alpine() (
+set -eu
+# 1. 环境准备与依赖安装
+echo "正在安装基础依赖..."
+run_cmd apk update
+run_cmd apk add curl gcompat ca-certificates unzip openrc iproute2 chrony openssl bind-tools python3 jq
+
+# 创建必要目录
+run_cmd mkdir -p "$XRAY_DIR" "$(dirname "$XRAY_BIN")" /var/log /etc/local.d
+
+# 1.5 时间同步（REALITY 对时间误差非常敏感）
+echo "正在配置时间同步..."
+if [ -f /etc/chrony/chrony.conf ]; then
+    if ! grep -q "pool.ntp.org" /etc/chrony/chrony.conf 2>/dev/null; then
+        echo "server pool.ntp.org iburst" >> /etc/chrony/chrony.conf
+    fi
+fi
+rc-update add chronyd default 2>/dev/null || true
+rc-service chronyd start 2>/dev/null || true
+chronyc -a makestep 2>/dev/null || true
+date
+
+# 2. 下载并安装最新版 Xray-core（带重试机制）
+echo "正在下载 Xray-core..."
+XRAY_ZIP="/tmp/xray-$$.zip"
+trap "rm -f $XRAY_ZIP" EXIT  # 确保删除临时文件
+
+# 添加重试逻辑（最多3次尝试）
+RETRY=0
+MAX_RETRIES=3
+while [ $RETRY -lt $MAX_RETRIES ]; do
+    if curl -L --connect-timeout 10 --max-time 60 -o "$XRAY_ZIP" \
+        "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"; then
+        break
+    fi
+    RETRY=$((RETRY + 1))
+    if [ $RETRY -lt $MAX_RETRIES ]; then
+        echo "下载失败，5秒后重试 $RETRY/$MAX_RETRIES..."
+        sleep 5
+    fi
+done
+
+if [ $RETRY -eq $MAX_RETRIES ]; then
+    error_exit "无法下载 Xray-core，超过最大重试次数"
+fi
+
+# 验证 ZIP 文件有效性
+if [ ! -f "$XRAY_ZIP" ] || [ ! -s "$XRAY_ZIP" ]; then
+    error_exit "下载的 Xray 文件无效或为空"
+fi
+
+run_cmd unzip -o "$XRAY_ZIP" xray -d "$(dirname "$XRAY_BIN")"
+run_cmd chmod +x "$XRAY_BIN"
+
+# 验证 Xray 二进制文件可执行性
+if ! "$XRAY_BIN" version </dev/null > /dev/null 2>&1; then
+    error_exit "Xray 二进制文件损坏或架构不兼容"
+fi
+echo "Xray 版本: $("$XRAY_BIN" version </dev/null 2>/dev/null | head -n 1)"
+
+# 3. 动态生成身份凭证（安全提取）
+echo "正在生成加密密钥..."
+USER_UUID=$("$XRAY_BIN" uuid </dev/null)
+
+KEYS_OUTPUT=$("$XRAY_BIN" x25519 </dev/null)
+echo "调试信息 - Xray x25519 输出:" >&2
+echo "$KEYS_OUTPUT" >&2
+
+KEY_LINES=$(extract_reality_keys "$KEYS_OUTPUT")
+PRIV_KEY=$(echo "$KEY_LINES" | sed -n '1p')
+PUB_KEY=$(echo "$KEY_LINES" | sed -n '2p')
+
+# 验证密钥是否成功提取
+[ -z "$PRIV_KEY" ] && error_exit "无法提取私钥，原始输出: $KEYS_OUTPUT"
+[ -z "$PUB_KEY" ] && error_exit "无法提取公钥，原始输出: $KEYS_OUTPUT"
+[ -z "$USER_UUID" ] && error_exit "无法生成 UUID"
+validate_b64_key "$PRIV_KEY" "PrivateKey"
+validate_b64_key "$PUB_KEY" "PublicKey"
+if [ "$PRIV_KEY" = "$PUB_KEY" ]; then
+    error_exit "私钥与公钥相同，密钥解析错误"
+fi
+
+echo "✅ 密钥生成成功"
+echo "  PrivateKey 长度: $(printf %s "$PRIV_KEY" | wc -c | tr -d ' ')"
+echo "  PublicKey  长度: $(printf %s "$PUB_KEY" | wc -c | tr -d ' ')"
+echo "  说明: 新版 Xray 的 Password 字段 = 客户端 PublicKey（已自动映射）"
+
+# 3.5 多地域伪装目标严格检测（避免 SNI 不可达导致客户端 -1ms）
+echo "正在选择并校验 Reality 伪装目标..."
+if ! SNI=$(detect_best_sni); then
+    error_exit "没有可用的 Reality 伪装目标（SNI/dest）。请检查 VPS 出站 443/DNS 后重试"
+fi
+assert_sni_usable "$SNI"
+DEST_SITE="${SNI}:443"
+echo "将使用: SNI=$SNI  DEST=$DEST_SITE  region=$(sni_region_of "$SNI")"
+
+# 3.8 可选 SOCKS5 入站
+configure_socks_optional
+
+# 4. 生成 Xray 配置文件
+# 说明：
+# - 默认监听 0.0.0.0，避免某些 LXC/NAT 环境只绑 loopback
+# - 日志改为 warning + 文件，便于排查“端口通但连不上 / 延迟 -1ms”
+# - shortIds 同时保留空值和固定值，兼容部分客户端默认空 shortId
+echo "正在生成配置文件..."
+echo "  (写入 $XRAY_CONFIG )"
+cat > "$XRAY_CONFIG" << CONF
+{
+    "log": {
+        "loglevel": "warning",
+        "access": "$XRAY_LOG",
+        "error": "$XRAY_LOG"
+    },
+    "inbounds": [{
+        "listen": "0.0.0.0",
+        "port": $PORT,
+        "protocol": "vless",
+        "settings": {
+            "clients": [{
+                "id": "$USER_UUID",
+                "flow": "xtls-rprx-vision"
+            }],
+            "decryption": "none"
+        },
+        "streamSettings": {
+            "network": "tcp",
+            "security": "reality",
+            "realitySettings": {
+                "show": false,
+                "dest": "$DEST_SITE",
+                "xver": 0,
+                "serverNames": ["$SNI"],
+                "privateKey": "$PRIV_KEY",
+                "shortIds": ["", "$SHORT_ID"]
+            }
+        },
+        "sniffing": {
+            "enabled": true,
+            "destOverride": ["http", "tls", "quic"]
+        }
+    }],
+    "outbounds": [{
+        "protocol": "freedom",
+        "settings": {}
+    }]
+}
+CONF
+echo "  基础配置已写入"
+
+# 验证 JSON 配置文件格式（优先 jq，没有 jq 时做基础检查）
+if command -v jq >/dev/null 2>&1; then
+    if ! jq empty "$XRAY_CONFIG" 2>/dev/null; then
+        error_exit "配置文件 JSON 格式错误"
+    fi
+    echo "✅ 配置文件 JSON 格式验证通过"
+else
+    if ! grep -q "\"privateKey\": \"$PRIV_KEY\"" "$XRAY_CONFIG"; then
+        error_exit "配置文件写入私钥失败"
+    fi
+    if ! grep -q "\"id\": \"$USER_UUID\"" "$XRAY_CONFIG"; then
+        error_exit "配置文件写入 UUID 失败"
+    fi
+    echo "⚠️  警告: 未安装 jq，已做基础字段检查 (apk add jq 可加强验证)"
+fi
+
+# Merge SOCKS5 inbound with jq when enabled
+if [ "${ENABLE_SOCKS:-0}" = "1" ]; then
+    if ! command -v jq >/dev/null 2>&1; then
+        error_exit "SOCKS5 requires jq"
+    fi
+    tmp_cfg="${XRAY_CONFIG}.socks.tmp"
+    if ! jq \
+        --argjson port "$SOCKS_PORT" \
+        --arg user "$SOCKS_USER" \
+        --arg pass "$SOCKS_PASS" \
+        '.inbounds += [{
+            tag: "socks-in",
+            listen: "0.0.0.0",
+            port: $port,
+            protocol: "socks",
+            settings: {
+                auth: "password",
+                accounts: [{user: $user, pass: $pass}],
+                udp: true
+            },
+            sniffing: {
+                enabled: true,
+                destOverride: ["http", "tls", "quic"]
+            }
+        }]' \
+        "$XRAY_CONFIG" > "$tmp_cfg"; then
+        rm -f "$tmp_cfg" 2>/dev/null || true
+        error_exit "failed to merge SOCKS5 inbound with jq"
+    fi
+    mv "$tmp_cfg" "$XRAY_CONFIG"
+    if ! jq -e --argjson port "$SOCKS_PORT" '.inbounds[] | select(.protocol=="socks" and .port==$port)' "$XRAY_CONFIG" >/dev/null; then
+        error_exit "SOCKS5 inbound missing after merge"
+    fi
+    echo "SOCKS5 inbound merged (port=$SOCKS_PORT)"
+    jq '.inbounds[] | select(.protocol=="socks") | {tag,listen,port,protocol,auth:.settings.auth,udp:.settings.udp,user:.settings.accounts[0].user}' "$XRAY_CONFIG" 2>/dev/null || true
+fi
+
+# 配置测试
+if ! "$XRAY_BIN" run -test -c "$XRAY_CONFIG" </dev/null >/tmp/xray-test.out 2>&1; then
+    echo "❌ Xray 配置测试失败:" >&2
+    cat /tmp/xray-test.out >&2 || true
+    error_exit "Xray 配置测试失败"
+fi
+echo "✅ Xray 配置测试通过"
+
+# 5. 系统网络优化（NAT 兼容性优先）
+echo "正在进行网络性能调优..."
+
+# 尝试启用 BBR（NAT 环境可能不支持，失败也继续）
+{
+    if [ -f /etc/sysctl.conf ]; then
+        grep -v "net.core.default_qdisc" /etc/sysctl.conf 2>/dev/null || true
+        grep -v "net.ipv4.tcp_congestion_control" /etc/sysctl.conf 2>/dev/null || true
+    fi
+    # 仅在 BBR 支持的环境下启用，否则降级到 cubic
+    echo "net.core.default_qdisc=fq"
+    echo "net.ipv4.tcp_congestion_control=bbr"
+} > /etc/sysctl.conf.tmp && mv /etc/sysctl.conf.tmp /etc/sysctl.conf
+
+# 应用 sysctl 配置，失败不中断
+if sysctl -p > /dev/null 2>&1; then
+    echo "✅ BBR 配置已应用"
+else
+    echo "⚠️  警告: BBR 在当前环境不可用，降级使用系统默认算法"
+    # 移除 BBR 配置以防启动失败
+    sed -i '/tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
+fi
+
+# 5.5 开放端口（容器内防火墙 + 提示宿主机/安全组）
+open_firewall_port "$PORT"
+if [ "${ENABLE_SOCKS:-0}" = "1" ]; then
+    open_firewall_port "$SOCKS_PORT"
+fi
+
+# 6. 配置开机自启与 MTU 修正（NAT 环境兼容）
+# 关键修复：同时提供 start/stop，避免 rc-service local restart 只启动不杀旧进程
+echo "正在配置开机自启..."
+cat > /etc/local.d/xray.start << 'START'
+#!/bin/sh
+# NAT 兼容的网卡检测和 MTU 设置
+
+# 自动检测网卡名称
+NETIF=$(ip route 2>/dev/null | grep default | awk '{print $5}' | head -1)
+if [ -z "$NETIF" ]; then
+    NETIF="eth0"
+fi
+
+echo "检测到网卡: $NETIF"
+
+# 尝试设置 MTU（重要：解决 NAT 环境丢包）
+# 1380 是 NAT 环境的通用安全值
+if command -v ip >/dev/null 2>&1; then
+    ip link set dev "$NETIF" mtu 1380 2>/dev/null || true
+elif command -v ifconfig >/dev/null 2>&1; then
+    ifconfig "$NETIF" mtu 1380 2>/dev/null || true
+fi
+
+# 验证 MTU 设置
+CURRENT_MTU=$(ip link show "$NETIF" 2>/dev/null | sed -n 's/.*mtu \([0-9][0-9]*\).*/\1/p' || echo "")
+if [ "$CURRENT_MTU" = "1380" ]; then
+    echo "✅ MTU 已设置为 1380"
+else
+    echo "⚠️  MTU 设置失败（在此 NAT 环境可能无法修改），使用系统默认值继续运行"
+fi
+
+# 防止重复启动导致端口被旧进程占用、新配置不生效
+if command -v pkill >/dev/null 2>&1; then
+    pkill -f "/usr/local/bin/xray run -c /etc/xray/config.json" 2>/dev/null || true
+else
+    kill $(ps | grep "[x]ray run -c /etc/xray/config.json" | awk '{print $1}') 2>/dev/null || true
+fi
+sleep 1
+
+# 启动 Xray；日志写入文件，避免“全黑洞”无法排障
+touch /var/log/xray.log 2>/dev/null || true
+/usr/local/bin/xray run -c /etc/xray/config.json >> /var/log/xray.log 2>&1 &
+START
+
+cat > /etc/local.d/xray.stop << 'STOP'
+#!/bin/sh
+# OpenRC local 服务 stop 钩子：确保重启时旧 Xray 进程被清理
+if command -v pkill >/dev/null 2>&1; then
+    pkill -f "/usr/local/bin/xray run -c /etc/xray/config.json" 2>/dev/null || true
+else
+    kill $(ps | grep "[x]ray run -c /etc/xray/config.json" | awk '{print $1}') 2>/dev/null || true
+fi
+STOP
+
+run_cmd chmod +x /etc/local.d/xray.start
+run_cmd chmod +x /etc/local.d/xray.stop
+run_cmd rc-update add local default
+
+# 先停再启，确保旧进程不会残留
+rc-service local stop 2>/dev/null || true
+# 保险再杀一次
+if command -v pkill >/dev/null 2>&1; then
+    pkill -f "/usr/local/bin/xray run -c /etc/xray/config.json" 2>/dev/null || true
+fi
+run_cmd rc-service local start
+
+# 验证服务是否成功启动
+sleep 2
+if pgrep -f "xray run" > /dev/null 2>&1 || ps | grep -q "[x]ray run"; then
+    echo "✅ Xray 服务已成功启动"
+else
+    echo "⚠️  警告: Xray 服务可能启动失败，检查配置或日志"
+    echo "   日志: tail -n 50 $XRAY_LOG"
+fi
+
+# 6.5 安装后连通性自检（专门针对客户端延迟 -1ms）
+echo ""
+echo "正在进行安装后自检（针对延迟 -1ms）..."
+if command -v ss >/dev/null 2>&1; then
+    if ss -tln 2>/dev/null | grep -Eq ":${PORT}\\b"; then
+        echo "✅ 本机已监听 0.0.0.0:${PORT}（或 *: ${PORT}）"
+        ss -tln 2>/dev/null | grep -E ":${PORT}\\b" || true
+    else
+        echo "❌ 未检测到端口 ${PORT} 监听 —— 客户端必现 -1ms"
+        echo "   请查看: tail -n 100 $XRAY_LOG"
+    fi
+elif command -v netstat >/dev/null 2>&1; then
+    netstat -tln 2>/dev/null | grep -E ":${PORT}\\b" && echo "✅ 端口 ${PORT} 已监听" || echo "❌ 端口 ${PORT} 未监听"
+else
+    echo "⚠️  无 ss/netstat，跳过监听检查"
+fi
+
+# 7. 配置定时重启任务（防止小内存 OOM）
+echo "正在配置定时重启任务..."
+CRON_DIR="/var/spool/cron/crontabs"
+run_cmd mkdir -p "$CRON_DIR"
+
+# 避免重复添加 cron 任务（追加，不要整文件覆盖，防止抹掉其他任务）
+touch "$CRON_DIR/root"
+chmod 600 "$CRON_DIR/root"
+if ! grep -q "rc-service local restart" "$CRON_DIR/root" 2>/dev/null; then
+    echo "0 4 * * * rc-service local restart" >> "$CRON_DIR/root"
+fi
+
+run_cmd rc-update add crond default
+run_cmd rc-service crond start
+
+# 8. 输出安装结果
+echo ""
+# SOCKS5 local self-check
+if [ "${ENABLE_SOCKS:-0}" = "1" ]; then
+    echo ""
+    echo "Checking SOCKS5 locally..."
+    if command -v ss >/dev/null 2>&1; then
+        if ss -tln 2>/dev/null | grep -Eq ":${SOCKS_PORT}\\b"; then
+            echo "SOCKS port ${SOCKS_PORT} is listening"
+            ss -tlnp 2>/dev/null | grep -E ":${SOCKS_PORT}\\b" || true
+        else
+            echo "SOCKS port ${SOCKS_PORT} NOT listening"
+        fi
+    fi
+    socks_ok=0
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsS --connect-timeout 8 --max-time 15 \
+            --socks5-hostname "127.0.0.1:${SOCKS_PORT}" \
+            -U "${SOCKS_USER}:${SOCKS_PASS}" \
+            "https://api.ipify.org" >/tmp/socks-test.out 2>/tmp/socks-test.err; then
+            _socks_ip=$(tr -d '\r\n' </tmp/socks-test.out 2>/dev/null || true)
+            echo "SOCKS5 local proxy OK, egress IP: ${_socks_ip}"
+            socks_ok=1
+        elif curl -fsS --connect-timeout 8 --max-time 15 \
+            -x "socks5h://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${SOCKS_PORT}" \
+            "https://api.ipify.org" >/tmp/socks-test.out 2>/tmp/socks-test.err; then
+            _socks_ip=$(tr -d '\r\n' </tmp/socks-test.out 2>/dev/null || true)
+            echo "SOCKS5 local proxy OK, egress IP: ${_socks_ip}"
+            socks_ok=1
+        fi
+    fi
+    if [ "$socks_ok" -ne 1 ]; then
+        echo "SOCKS5 local proxy test FAILED"
+        tail -n 50 "$XRAY_LOG" 2>/dev/null || true
+        [ -f /tmp/socks-test.err ] && cat /tmp/socks-test.err 2>/dev/null || true
+    fi
+
+    echo "======================================================"
+    echo "CRITICAL: SOCKS port is NOT the same as Reality port"
+    echo "  Reality may work on TCP ${PORT}, while SOCKS needs TCP ${SOCKS_PORT}"
+    echo "  LXD/NAT/security-group usually allow ports ONE BY ONE"
+    echo "  ss listening inside container != reachable from internet"
+    echo "======================================================"
+    echo "Do these now on HOST (not only inside container):"
+    echo "  1) Cloud security group: allow inbound TCP ${SOCKS_PORT}"
+    echo "  2) LXD proxy (host):"
+    echo "     lxc config device add ${HOSTNAME:-INSTANCE} socks${SOCKS_PORT} proxy listen=tcp:0.0.0.0:${SOCKS_PORT} connect=tcp:127.0.0.1:${SOCKS_PORT}"
+    echo "     # if connect fails, try container eth IP instead of 127.0.0.1"
+    echo "  3) From your PC (not VPS):"
+    echo "     Test-NetConnection -ComputerName <PUBLIC_IP> -Port ${PORT}"
+    echo "     Test-NetConnection -ComputerName <PUBLIC_IP> -Port ${SOCKS_PORT}"
+    echo "     # Expect BOTH True. If 52300 True and ${SOCKS_PORT} False => mapping/SG issue"
+    echo "  4) Inside container local SOCKS proof:"
+    echo "     curl -fsS --socks5-hostname 127.0.0.1:${SOCKS_PORT} -U \"${SOCKS_USER}:${SOCKS_PASS}\" https://api.ipify.org"
+fi
+
+echo "正在获取公网 IP..."
+CLEAR_IP=$(get_public_ip)
+
+# 生成可导入的分享链接，减少手工填错（这是 -1ms 的高发原因）
+PBK_ENC=$(urlencode "$PUB_KEY")
+SHARE_LINK="vless://${USER_UUID}@${CLEAR_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PBK_ENC}&sid=${SHORT_ID}&type=tcp#Alpine-Reality-${PORT}"
+cat > "$SHARE_FILE" << LINKEOF
+地址 (Address): $CLEAR_IP
+端口 (Port): $PORT
+用户 ID (UUID): $USER_UUID
+流控 (Flow): xtls-rprx-vision
+传输安全 (Security): reality
+SNI: $SNI（多地域严格校验后的最优选择）
+公钥 (PublicKey / pbk): $PUB_KEY
+ShortID (sid): $SHORT_ID
+Fingerprint (fp): chrome
+网络 (Network): tcp
+
+$SOCKS_INFO_TEXT
+
+分享链接:
+$SHARE_LINK
+LINKEOF
+
+configure_subscription_https
+write_client_routing_files
+start_clash_sub_service
+subscription_verify_local
+
+cat << EOF
+-------------------------------------------------------
+✅ 安装成功！请妥善保存以下连接参数：
+-------------------------------------------------------
+地址 (Address): $CLEAR_IP
+端口 (Port): $PORT
+用户 ID (UUID): $USER_UUID
+流控 (Flow): xtls-rprx-vision
+传输安全 (Security): reality
+SNI: $SNI
+公钥 (PublicKey): $PUB_KEY
+ShortID: $SHORT_ID
+Fingerprint: chrome
+网络 (Network): tcp
+
+$SOCKS_INFO_TEXT
+-------------------------------------------------------
+📎 一键分享链接（推荐直接导入客户端，避免手填错误）:
+$SHARE_LINK
+
+参数已保存: $SHARE_FILE
+-------------------------------------------------------
+🧭 Clash 订阅（本机提供，不经过第三方转换站）:
+$CLASH_SUB_URL
+
+v2rayN 原生 VLESS 订阅（推荐 v2rayN 使用，节点内核选 Xray）:
+$V2RAYN_SUB_URL
+
+  用法: Clash Verge / mihomo → 新建订阅 → 粘贴上面链接 → 更新
+        模式保持「规则」，不要开全局
+        云安全组 / 宿主机映射请放行 TCP $CLASH_SUB_PORT
+        链接带随机口令，不要发给别人、不要发到公开处
+  规则: ACL4SSR_Online（配置在你自己的 VPS 上生成）
+  本地备份: $CLASH_FILE
+  证书迁移: 使用最新版脚本 --export-cert /root/sub-cert.p12 导出加密备份
+            新机器安装时选「导入加密证书备份」，导入后按提示配置续期
+-------------------------------------------------------
+🚨 客户端延迟一直是 -1ms 时，按这个顺序查（90% 是前 3 项）:
+  1) 云厂商安全组 / 防火墙是否放行 TCP $PORT 入站
+  2) LXC 宿主机是否做了端口映射/转发到容器 $PORT
+  3) 客户端地址是否填【公网 IP】而不是容器内网 IP
+  4) PublicKey 必须用上面输出（来自新版 x25519 的 Password 字段）
+  5) Flow=xtls-rprx-vision, fp=chrome, sid=$SHORT_ID, sni=$SNI
+  6) 服务器时间误差 < 90 秒: date / chronyc tracking
+  7) 本机诊断: sh xray.sh，选择 4
+  8) 日志: tail -n 100 $XRAY_LOG
+-------------------------------------------------------
+🔒 安全提示:
+  • 请不要在公共评论区贴出以上信息！
+  • 配置文件位于: $XRAY_CONFIG
+  • Clash 分流配置: $CLASH_FILE
+  • Xray 客户端分流: $XRAY_CLIENT_FILE
+  • 启动脚本位于: /etc/local.d/xray.start
+  • 停止脚本位于: /etc/local.d/xray.stop
+  • 日志文件位于: $XRAY_LOG
+  • 定时任务已配置：每日 04:00 自动重启清理内存
+
+🌍 NAT 环境兼容说明:
+  • MTU 已设置为 1380（解决长距离丢包）
+  • 若 MTU 设置失败：此环境不支持修改（继续使用系统默认值）
+  • BBR 自动检测：支持则启用，不支持则降级使用 cubic
+  • 已配置 chrony 时间同步（REALITY 对时间敏感）
+  • 容器内已尝试放行端口；宿主机映射与云安全组仍需你确认
+-------------------------------------------------------
+EOF
+
+)
+
+# Debian 安装流程（systemd / apt）。
+install_debian() (
+set -eu
 # 0.5 检测并设置时区和编码
 echo "正在检查时区..."
 CURRENT_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "unknown")
@@ -1779,9 +2296,9 @@ KEYS_OUTPUT=$("$XRAY_BIN" x25519 </dev/null)
 echo "调试信息 - Xray x25519 输出:" >&2
 echo "$KEYS_OUTPUT" >&2
 
-mapfile -t KEY_ARR < <(extract_reality_keys "$KEYS_OUTPUT")
-PRIV_KEY="${KEY_ARR[0]:-}"
-PUB_KEY="${KEY_ARR[1]:-}"
+KEY_LINES=$(extract_reality_keys "$KEYS_OUTPUT")
+PRIV_KEY=$(printf '%s\n' "$KEY_LINES" | sed -n '1p')
+PUB_KEY=$(printf '%s\n' "$KEY_LINES" | sed -n '2p')
 
 if [ -z "$PRIV_KEY" ]; then
     echo "❌ 错误: 无法提取私钥" >&2
@@ -2211,7 +2728,7 @@ $V2RAYN_SUB_URL
   4) PublicKey 用上面输出（新版 x25519 的 Password 字段）；不要填 Hash32
   5) Flow=xtls-rprx-vision, fp=chrome, sid=$SHORT_ID, sni=$SNI, network=tcp
   6) 服务器时间误差 < 90 秒: timedatectl / chronyc tracking
-  7) 本机诊断: bash xray-diagnostic.sh
+  7) 本机诊断: sh xray.sh，选择 4
   8) 日志: journalctl -u xray.service -n 80  与  tail -n 100 $XRAY_LOG
 -------------------------------------------------------
 🔒 安全提示:
@@ -2251,3 +2768,715 @@ $V2RAYN_SUB_URL
    然后运行: systemctl restart xray.service
 -------------------------------------------------------
 EOF
+
+)
+
+# 使用现有节点重新生成订阅。
+update_subscription() (
+    set -eu
+    umask 077
+    for cmd in python3 base64; do
+        command -v "$cmd" >/dev/null || error_exit "缺少命令: $cmd；请先安装本项目 Xray"
+    done
+    SUB_ENV=/etc/xray/clash-sub.env
+    task_tmp=$(mktemp -d)
+    trap 'rm -rf -- "$task_tmp"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+# 使用 shlex 编码后再读取，节点或环境文件中的内容不能成为 shell 命令。
+python3 - "$XRAY_CONFIG" "$SHARE_FILE" "$SUB_ENV" > "$task_tmp/node.env" <<'PY'
+import ipaddress
+import json
+import os
+import re
+import shlex
+import sys
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+config = json.loads(Path(sys.argv[1]).read_text())
+links = re.findall(r'^vless://\S+', Path(sys.argv[2]).read_text(), re.M)
+selected = None
+for link in links:
+    uri = urlsplit(link)
+    query = parse_qs(uri.query, keep_blank_values=True)
+    for inbound in config.get('inbounds', []):
+        reality = inbound.get('streamSettings', {}).get('realitySettings', {})
+        clients = inbound.get('settings', {}).get('clients', [])
+        if (inbound.get('protocol') == 'vless'
+                and uri.port == inbound.get('port')
+                and any(c.get('id') == uri.username and c.get('flow') == query.get('flow', [''])[0] for c in clients)
+                and query.get('sni', [''])[0] in reality.get('serverNames', [])
+                and query.get('sid', [''])[0] in reality.get('shortIds', [])
+                and query.get('security') == ['reality']
+                and query.get('flow') == ['xtls-rprx-vision']
+                and query.get('type') == ['tcp']
+                and query.get('fp') == ['chrome']
+                and query.get('pbk', [''])[0]):
+            selected = (link, uri, query)
+            break
+    if selected:
+        break
+if not selected:
+    sys.exit('找不到与现有 Xray 配置匹配的 VLESS 分享链接；停止更新，未改动 Xray')
+link, uri, query = selected
+if ipaddress.ip_address(uri.hostname).version != 4:
+    sys.exit('当前订阅模板需要原节点的公网 IPv4 地址')
+values = dict(SHARE_LINK=link, CLEAR_IP=uri.hostname, PORT=str(uri.port),
+              USER_UUID=uri.username, SNI=query['sni'][0],
+              SHORT_ID=query.get('sid', [''])[0], PUB_KEY=query['pbk'][0])
+if Path(sys.argv[3]).is_file():
+    allowed = {'CLASH_SUB_PORT', 'CLASH_SUB_PUBLIC_PORT', 'CLASH_SUB_TOKEN', 'CLASH_SUB_HOST', 'CLASH_SUB_TLS_CERT', 'CLASH_SUB_TLS_KEY'}
+    for line in Path(sys.argv[3]).read_text().splitlines():
+        key, sep, value = line.partition('=')
+        if sep and key in allowed:
+            values[key] = os.environ.get(key, value.strip())
+for key, value in values.items():
+    print(key + '=' + shlex.quote(value))
+PY
+. "$task_tmp/node.env"
+if [ "$CLASH_SUB_HTTPS" = auto ]; then
+    if [ -n "$CLASH_SUB_TLS_CERT$CLASH_SUB_TLS_KEY" ]; then
+        CLASH_SUB_HTTPS=existing
+    else
+        CLASH_SUB_HTTPS=off
+    fi
+fi
+CLASH_SUB_PORT="${CLASH_SUB_PORT:-58472}"
+CLASH_SUB_TOKEN="${CLASH_SUB_TOKEN:-}"
+CLASH_SUB_HOST="${CLASH_SUB_HOST:-}"
+CLASH_SUB_TLS_CERT="${CLASH_SUB_TLS_CERT:-}"
+CLASH_SUB_TLS_KEY="${CLASH_SUB_TLS_KEY:-}"
+
+configure_subscription_https
+
+backup_dir="/etc/xray/subscription-backup-$(date +%Y%m%d-%H%M%S)-$$"
+mkdir -p "$backup_dir"
+for file in "$SHARE_FILE" "$CLASH_FILE" "$XRAY_CLIENT_FILE" "$V2RAYN_SUB_FILE" "$SUB_ENV" /usr/local/bin/xray-clash-sub.py; do
+    [ ! -f "$file" ] || cp -p "$file" "$backup_dir/"
+done
+write_client_routing_files
+start_clash_sub_service
+if [ "$XRAY_PLATFORM" = debian ]; then
+    systemctl is-active --quiet xray-clash-sub.service || error_exit "订阅服务启动失败，请检查证书、端口和服务日志"
+else
+    pgrep -f /usr/local/bin/xray-clash-sub.py >/dev/null || error_exit "订阅服务启动失败，请检查 /var/log/xray-clash-sub.log"
+fi
+subscription_verify_local
+echo "订阅已更新。原有订阅文件备份: $backup_dir"
+echo "保留 Clash 策略组：使用 clash.yaml，内核为 mihomo；原生 VLESS：使用 vless.txt，内核选择 Xray。"
+echo "若从 HTTP 切换至 HTTPS，请在客户端替换订阅地址后更新。"
+
+)
+
+run_diagnostic() (
+set +eu
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+echo "=========================================="
+echo "🔍 Xray REALITY 诊断工具"
+echo "   目标现象: 客户端延迟 = -1ms / 连接失败"
+echo "=========================================="
+echo ""
+
+XRAY_CONFIG="${XRAY_CONFIG:-/etc/xray/config.json}"
+XRAY_LOG="${XRAY_LOG:-/var/log/xray.log}"
+SHARE_FILE="${SHARE_FILE:-/etc/xray/client-link.txt}"
+SCORE_OK=0
+SCORE_WARN=0
+SCORE_BAD=0
+
+ok() { echo -e "${GREEN}✅ $1${NC}"; SCORE_OK=$((SCORE_OK + 1)); }
+warn() { echo -e "${YELLOW}⚠️  $1${NC}"; SCORE_WARN=$((SCORE_WARN + 1)); }
+bad() { echo -e "${RED}❌ $1${NC}"; SCORE_BAD=$((SCORE_BAD + 1)); }
+
+if [ ! -f "$XRAY_CONFIG" ]; then
+    bad "未找到配置文件: $XRAY_CONFIG"
+    echo "请确认已运行安装脚本，或 export XRAY_CONFIG=/path/to/config.json"
+    exit 1
+fi
+
+XRAY_PORT=$(sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$XRAY_CONFIG" | head -1)
+SNI=$(sed -n 's/.*"serverNames"[[:space:]]*:[[:space:]]*\[[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
+PRIV_KEY=$(sed -n 's/.*"privateKey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
+SHORT_ID=$(sed -n 's/.*"shortIds"[[:space:]]*:[[:space:]]*\[[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
+# shortIds 可能以 "" 开头，再取下一个非空
+if [ -z "$SHORT_ID" ]; then
+    SHORT_ID=$(grep -o '"shortIds"[[:space:]]*:[[:space:]]*\[[^]]*\]' "$XRAY_CONFIG" | head -1 | grep -o '"[0-9a-fA-F]*"' | tr -d '"' | grep -v '^$' | head -1)
+fi
+DEST=$(sed -n 's/.*"dest"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
+UUID=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
+LISTEN=$(sed -n 's/.*"listen"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
+FLOW=$(sed -n 's/.*"flow"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
+
+[ -z "$XRAY_PORT" ] && XRAY_PORT="52300"
+[ -z "$SNI" ] && SNI="unknown"
+[ -z "$LISTEN" ] && LISTEN="(未显式配置，默认 0.0.0.0)"
+
+echo "配置摘要"
+echo "  配置文件: $XRAY_CONFIG"
+echo "  监听: $LISTEN"
+echo "  端口: $XRAY_PORT"
+echo "  UUID: ${UUID:-未读到}"
+echo "  Flow: ${FLOW:-未读到}"
+echo "  SNI: $SNI"
+echo "  dest: ${DEST:-未读到}"
+echo "  ShortId: ${SHORT_ID:-未读到}"
+echo "  PrivateKey 长度: $(printf %s "$PRIV_KEY" | wc -c | tr -d ' ')"
+echo ""
+
+# 1. 进程 / 服务状态
+echo "=========================================="
+echo "1️⃣  服务/进程状态"
+echo "=========================================="
+if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^xray.service'; then
+    if systemctl is-active --quiet xray.service; then
+        ok "systemd: xray.service 为 active"
+    else
+        bad "systemd: xray.service 未运行"
+        systemctl status xray.service --no-pager -l 2>/dev/null | head -n 20 || true
+    fi
+elif command -v rc-service >/dev/null 2>&1; then
+    if pgrep -f "xray run" >/dev/null 2>&1 || ps 2>/dev/null | grep -q "[x]ray run"; then
+        ok "检测到 xray 进程（OpenRC/local.d）"
+    else
+        bad "未检测到 xray 进程"
+        echo "尝试: rc-service local restart"
+    fi
+else
+    if pgrep -f "xray" >/dev/null 2>&1 || ps 2>/dev/null | grep -q "[x]ray"; then
+        ok "检测到 xray 相关进程"
+    else
+        bad "未检测到 xray 进程 —— 客户端会显示 -1ms"
+    fi
+fi
+echo ""
+
+# 2. 端口监听（-1ms 最关键）
+echo "=========================================="
+echo "2️⃣  端口监听检查（-1ms 高发点）"
+echo "=========================================="
+LISTEN_INFO=""
+if command -v ss >/dev/null 2>&1; then
+    LISTEN_INFO=$(ss -tlnp 2>/dev/null | grep -E ":${XRAY_PORT}\\b" || true)
+elif command -v netstat >/dev/null 2>&1; then
+    LISTEN_INFO=$(netstat -tlnp 2>/dev/null | grep -E ":${XRAY_PORT}\\b" || true)
+fi
+
+if [ -n "$LISTEN_INFO" ]; then
+    ok "端口 $XRAY_PORT 正在监听"
+    echo "$LISTEN_INFO"
+    if echo "$LISTEN_INFO" | grep -q '127.0.0.1'; then
+        if ! echo "$LISTEN_INFO" | grep -Eq '0\.0\.0\.0|\*'; then
+            bad "似乎只监听 127.0.0.1 —— 外网必然 -1ms。请把 listen 改为 0.0.0.0"
+        fi
+    fi
+else
+    bad "端口 $XRAY_PORT 未监听 —— 客户端延迟几乎一定是 -1ms"
+fi
+echo ""
+
+# 3. 本机回环连通
+echo "=========================================="
+echo "3️⃣  本机 TCP 连通"
+echo "=========================================="
+LOCAL_OK=0
+if command -v nc >/dev/null 2>&1; then
+    if nc -z -w 3 127.0.0.1 "$XRAY_PORT" 2>/dev/null; then
+        ok "127.0.0.1:$XRAY_PORT TCP 可连接"
+        LOCAL_OK=1
+    fi
+fi
+if [ "$LOCAL_OK" -eq 0 ] && command -v timeout >/dev/null 2>&1; then
+    if timeout 3 bash -c "echo >/dev/tcp/127.0.0.1/$XRAY_PORT" 2>/dev/null; then
+        ok "127.0.0.1:$XRAY_PORT TCP 可连接"
+        LOCAL_OK=1
+    fi
+fi
+if [ "$LOCAL_OK" -eq 0 ]; then
+    warn "本机 TCP 探测失败（REALITY 可能不回普通探测，结合监听结果判断）"
+fi
+echo ""
+
+# 4. 防火墙
+echo "=========================================="
+echo "4️⃣  本机防火墙"
+echo "=========================================="
+if command -v ufw >/dev/null 2>&1; then
+    UFW_STATUS=$(ufw status 2>/dev/null || true)
+    echo "$UFW_STATUS" | head -n 5
+    if echo "$UFW_STATUS" | grep -qi "Status: active"; then
+        if echo "$UFW_STATUS" | grep -q "$XRAY_PORT"; then
+            ok "ufw 已放行 $XRAY_PORT"
+        else
+            bad "ufw 已启用但未见 $XRAY_PORT —— 外网会 -1ms"
+            echo "修复: sudo ufw allow ${XRAY_PORT}/tcp && sudo ufw reload"
+        fi
+    else
+        ok "ufw 未启用（或 inactive）"
+    fi
+fi
+
+if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -qi running; then
+    if firewall-cmd --list-ports 2>/dev/null | grep -q "$XRAY_PORT"; then
+        ok "firewalld 已放行 $XRAY_PORT"
+    else
+        bad "firewalld 运行中但可能未放行 $XRAY_PORT"
+        echo "修复: firewall-cmd --permanent --add-port=${XRAY_PORT}/tcp && firewall-cmd --reload"
+    fi
+fi
+
+if command -v iptables >/dev/null 2>&1; then
+    echo "iptables INPUT 摘要:"
+    iptables -L INPUT -n 2>/dev/null | head -n 12 || true
+    if iptables -C INPUT -p tcp --dport "$XRAY_PORT" -j ACCEPT 2>/dev/null; then
+        ok "iptables 存在 ${XRAY_PORT}/tcp ACCEPT"
+    else
+        warn "未找到显式 iptables ACCEPT（若默认策略不是 DROP 可能仍可用）"
+    fi
+fi
+echo ""
+warn "容器内防火墙通过 ≠ 外网可达。还必须查：云安全组 + 宿主机端口映射/NAT"
+echo ""
+
+# 5. 公网 IP 与地址填写提示
+echo "=========================================="
+echo "5️⃣  公网 IP / 地址填写"
+echo "=========================================="
+PUB_IP=""
+for url in "https://api.ipify.org" "https://ifconfig.me/ip" "https://ipv4.icanhazip.com"; do
+    PUB_IP=$(curl -4 -fsS --connect-timeout 4 --max-time 6 "$url" 2>/dev/null | tr -d '\r\n' || true)
+    echo "$PUB_IP" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && break
+    PUB_IP=""
+done
+LOCAL_IPS=$(ip -4 addr 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | grep -v '^127\.' || true)
+echo "检测到的公网 IP: ${PUB_IP:-获取失败}"
+echo "容器/主机内网 IP:"
+echo "${LOCAL_IPS:-无}"
+if [ -n "$PUB_IP" ]; then
+    ok "可用公网 IP 参考: $PUB_IP"
+    echo "客户端 Address 应填公网 IP（或域名），不要填 10.x / 100.x / 172.16-31.x 内网地址"
+else
+    warn "无法获取公网 IP（NAT 常见）。客户端请填【宿主机公网 IP】"
+fi
+if [ -f "$SHARE_FILE" ]; then
+    echo "分享参数文件: $SHARE_FILE"
+    head -n 20 "$SHARE_FILE" 2>/dev/null || true
+fi
+echo ""
+
+# 6. MTU
+echo "=========================================="
+echo "6️⃣  MTU"
+echo "=========================================="
+DEFAULT_DEV=$(ip route 2>/dev/null | grep default | awk '{print $5}' | head -1)
+if [ -n "$DEFAULT_DEV" ]; then
+    MTU=$(ip link show "$DEFAULT_DEV" 2>/dev/null | sed -n 's/.*mtu \([0-9][0-9]*\).*/\1/p')
+    echo "网卡: $DEFAULT_DEV  MTU: ${MTU:-未知}"
+    if [ "$MTU" = "1380" ] || [ "$MTU" = "1500" ] || [ "$MTU" = "1450" ] || [ "$MTU" = "1400" ]; then
+        ok "MTU 看起来合理"
+    else
+        warn "MTU 值异常，可尝试: ip link set dev $DEFAULT_DEV mtu 1380"
+    fi
+else
+    warn "无法检测默认网卡"
+fi
+echo ""
+
+# 7. SNI / dest 可达
+echo "=========================================="
+echo "7️⃣  伪装目标 SNI/dest 严格校验（-1ms 高发根因）"
+echo "=========================================="
+echo "目标: SNI=$SNI  dest=${DEST:-$SNI:443}"
+SNI_BAD=0
+if [ -z "$SNI" ] || [ "$SNI" = "unknown" ]; then
+    bad "未读到 serverNames/SNI"
+    SNI_BAD=1
+else
+    # DNS
+    if command -v nslookup >/dev/null 2>&1; then
+        if nslookup "$SNI" >/dev/null 2>&1; then
+            ok "DNS 可解析: $SNI"
+        else
+            bad "DNS 无法解析 $SNI"
+            SNI_BAD=1
+        fi
+    fi
+    # TCP 443
+    if command -v nc >/dev/null 2>&1; then
+        if nc -z -w 4 "$SNI" 443 >/dev/null 2>&1; then
+            ok "TCP 443 可达"
+        else
+            bad "TCP 443 不可达 —— Reality dest 失败会直接导致客户端 -1ms"
+            SNI_BAD=1
+        fi
+    fi
+    # HTTPS
+    CODE=$(curl -sS -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 8 -I "https://$SNI" 2>/dev/null || echo "000")
+    if [ "$CODE" != "000" ]; then
+        ok "HTTPS 有响应 (HTTP $CODE)"
+    else
+        bad "HTTPS 无响应"
+        SNI_BAD=1
+    fi
+    # TLS1.3
+    if curl -sS -o /dev/null --connect-timeout 5 --max-time 8 --tlsv1.3 -I "https://$SNI" 2>/dev/null; then
+        ok "TLS1.3 可用（Reality 推荐）"
+    else
+        warn "TLS1.3 探测失败（部分环境 curl 参数受限；建议 openssl 复核）"
+    fi
+    # HTTP2
+    if curl -sS -o /dev/null --connect-timeout 5 --max-time 8 --http2 -I "https://$SNI" 2>/dev/null; then
+        ok "HTTP/2 可用"
+    else
+        warn "HTTP/2 探测失败"
+    fi
+    if command -v openssl >/dev/null 2>&1; then
+        if echo | openssl s_client -tls1_3 -connect "$SNI:443" -servername "$SNI" >/dev/null 2>&1; then
+            ok "openssl TLS1.3 握手成功"
+        else
+            bad "openssl 无法完成 TLS1.3 握手 —— 不适合作为 Reality dest"
+            SNI_BAD=1
+        fi
+    fi
+fi
+if [ "$SNI_BAD" -eq 1 ]; then
+    echo "修复建议:"
+    echo "  1) 重跑最新安装脚本（自动从美国/欧洲/印度/俄罗斯/亚太 30 个候选中挑选可用 SNI）"
+    echo "  2) 或手动把 config.json 的 dest/serverNames 改成 VPS 能访问的站点后重启"
+fi
+echo ""
+
+# 8. 配置完整性
+echo "=========================================="
+echo "8️⃣  配置完整性"
+echo "=========================================="
+if command -v jq >/dev/null 2>&1; then
+    if jq empty "$XRAY_CONFIG" 2>/dev/null; then
+        ok "JSON 格式正确"
+    else
+        bad "JSON 格式错误"
+        jq empty "$XRAY_CONFIG" 2>&1 | head -5
+    fi
+    echo "realitySettings:"
+    jq '.inbounds[0].streamSettings.realitySettings' "$XRAY_CONFIG" 2>/dev/null || true
+else
+    warn "未安装 jq，跳过深度 JSON 检查"
+fi
+
+if [ -z "$PRIV_KEY" ]; then
+    bad "未读到 privateKey"
+else
+    LEN=$(printf %s "$PRIV_KEY" | wc -c | tr -d ' ')
+    if [ "$LEN" -ge 40 ] && [ "$LEN" -le 64 ]; then
+        ok "privateKey 长度正常 ($LEN)"
+    else
+        bad "privateKey 长度异常 ($LEN) —— 密钥解析可能错了"
+    fi
+fi
+
+if [ -z "$UUID" ]; then
+    bad "未读到 UUID"
+else
+    ok "UUID 存在"
+fi
+
+if [ "$FLOW" = "xtls-rprx-vision" ]; then
+    ok "flow = xtls-rprx-vision"
+else
+    warn "flow 不是 xtls-rprx-vision（当前: ${FLOW:-空}）"
+fi
+
+if [ -z "$SHORT_ID" ]; then
+    warn "未读到 shortId（若服务端 shortIds 含空字符串，客户端 sid 可留空）"
+else
+    ok "ShortId: $SHORT_ID"
+fi
+echo ""
+
+# 9. 时间与日志
+echo "=========================================="
+echo "9️⃣  时间与日志（REALITY 关键）"
+echo "=========================================="
+echo "当前时间: $(date)"
+if command -v timedatectl >/dev/null 2>&1; then
+    timedatectl 2>/dev/null | head -n 6 || true
+fi
+if command -v chronyc >/dev/null 2>&1; then
+    chronyc tracking 2>/dev/null | head -n 8 || true
+fi
+
+# 粗略提醒：如果系统时间年份离谱
+YEAR=$(date +%Y 2>/dev/null || echo 0)
+if [ "$YEAR" -lt 2024 ] || [ "$YEAR" -gt 2100 ]; then
+    bad "系统时间异常（年份 $YEAR）—— Reality 会直接失败"
+else
+    ok "系统时间年份看起来正常"
+fi
+
+if [ -f "$XRAY_LOG" ]; then
+    ok "日志文件存在: $XRAY_LOG"
+    echo "最近日志:"
+    tail -n 40 "$XRAY_LOG" 2>/dev/null || true
+else
+    warn "未找到 $XRAY_LOG"
+fi
+
+if command -v journalctl >/dev/null 2>&1; then
+    echo "journalctl -u xray.service 最近记录:"
+    journalctl -u xray.service -n 30 --no-pager 2>/dev/null || true
+fi
+echo ""
+
+# 10. 外网视角提示
+echo "=========================================="
+echo "🔟 外网可达性（需在【你的电脑】上测）"
+echo "=========================================="
+echo "下面这些命令请在客户端电脑执行，不要只在 VPS 里测："
+echo "  # Windows PowerShell"
+echo "  Test-NetConnection -ComputerName <公网IP> -Port $XRAY_PORT"
+echo "  # 或"
+echo "  telnet <公网IP> $XRAY_PORT"
+echo "  # Linux/macOS"
+echo "  nc -vz <公网IP> $XRAY_PORT"
+echo "  curl -v telnet://<公网IP>:$XRAY_PORT"
+echo ""
+echo "若本机监听正常，但你电脑 Test-NetConnection 失败 = 100% 是"
+echo "  云安全组 / 运营商防火墙 / LXC·LXD 端口未映射 问题，"
+echo "  客户端会稳定显示延迟 -1ms。"
+echo ""
+
+# 总结
+echo "=========================================="
+echo "📊
+# Extra: Reality port vs SOCKS port misconception
+echo "=========================================="
+echo "Reality port vs other inbound ports"
+echo "=========================================="
+echo "Inside-container listening only proves local process bind."
+echo "On LXD/NAT, each TCP port usually needs its own:"
+echo "  - cloud security group rule"
+echo "  - lxc proxy / iptables DNAT / panel port map"
+echo "So TCP 52300 reachable does NOT imply TCP <SOCKS_PORT> reachable."
+echo "From your PC compare:"
+echo "  Test-NetConnection IP -Port 52300"
+echo "  Test-NetConnection IP -Port <SOCKS_PORT>"
+echo ""
+诊断汇总"
+echo "=========================================="
+echo "通过: $SCORE_OK   警告: $SCORE_WARN   严重: $SCORE_BAD"
+echo ""
+echo "延迟 -1ms 最常见根因排序:"
+echo "  1. 云安全组未放行 TCP $XRAY_PORT"
+echo "  2. LXC/LXD NAT 未做端口映射到容器"
+echo "  3. 客户端填了内网 IP，或 PublicKey/UUID/ShortId/SNI 不一致"
+echo "  4. 新版 Xray 把 Password 当 PublicKey；误填 Hash32 会失败"
+echo "  5. 系统时间偏差过大 / dest 站点服务器访问不了"
+echo "  6. xray 未真正监听 0.0.0.0:$XRAY_PORT"
+echo ""
+echo "建议修复命令:"
+echo "  # 看监听"
+echo "  ss -tlnp | grep $XRAY_PORT"
+echo "  # 看日志"
+echo "  tail -n 100 $XRAY_LOG"
+echo "  journalctl -u xray.service -n 80 --no-pager"
+echo "  # Debian LXD 端口映射示例"
+echo "  lxc config device add <实例> xrayproxy proxy listen=tcp:0.0.0.0:$XRAY_PORT connect=tcp:127.0.0.1:$XRAY_PORT"
+echo "  # 返回管理菜单，选择 4 重新诊断；订阅问题选择 2 或 3"
+echo ""
+if [ "$SCORE_BAD" -gt 0 ]; then
+    echo -e "${RED}结论: 发现 $SCORE_BAD 个严重问题，优先处理后再测客户端。${NC}"
+    exit 2
+fi
+if [ "$SCORE_WARN" -gt 0 ]; then
+    echo -e "${YELLOW}结论: 服务可能已起来，但仍有 $SCORE_WARN 个警告；若仍 -1ms，重点查安全组与端口映射。${NC}"
+    exit 0
+fi
+echo -e "${GREEN}结论: 本机侧未见明显异常。若客户端仍 -1ms，基本可断定是安全组/NAT 映射/客户端参数问题。${NC}"
+echo "=========================================="
+echo "✅ 诊断完成"
+echo "=========================================="
+
+
+)
+
+# 菜单和操作分发。各操作在子 shell 执行，失败后仍可返回菜单。
+manager_read() {
+    printf '%s' "$1" >&2
+    IFS= read -r manager_reply <&9 || return 1
+    printf '%s' "$manager_reply"
+}
+
+manager_platform() (
+    if [ -f /etc/alpine-release ]; then
+        printf '%s' alpine
+    elif [ -f /etc/os-release ]; then
+        . /etc/os-release
+        case "${ID:-}" in
+            debian) printf '%s' debian ;;
+            *) return 1 ;;
+        esac
+    else
+        return 1
+    fi
+)
+
+manager_require_root() {
+    [ "$(id -u)" = 0 ] || error_exit "请以 root 运行：sudo sh xray.sh"
+}
+
+manager_require_platform() {
+    XRAY_PLATFORM=$(manager_platform) || error_exit "目前支持 Alpine Linux（OpenRC）和 Debian（systemd）"
+    case "$XRAY_PLATFORM" in
+        alpine) CLIENT_NODE_NAME=Alpine-Reality ;;
+        debian) CLIENT_NODE_NAME=Debian-Reality ;;
+    esac
+}
+
+manager_install() {
+    manager_require_platform
+    [ "$(uname -m)" = x86_64 ] || error_exit "当前安装包仅支持 x86_64 / amd64"
+    if [ -f "$XRAY_CONFIG" ]; then
+        echo "检测到已有 Xray 配置。重新安装会生成新的 UUID、密钥和订阅口令。"
+        echo "更新订阅请选 2，开启 HTTPS 请选 3。"
+        manager_confirm=$(manager_read '确认重新安装请输入 y，其他输入取消: ') || return 1
+        case "$manager_confirm" in
+            y|Y) ;;
+            *) echo "已取消安装。"; return 0 ;;
+        esac
+    fi
+    case "$XRAY_PLATFORM" in
+        alpine) install_alpine ;;
+        debian) install_debian ;;
+    esac
+}
+
+manager_show_client() {
+    [ -f "$SHARE_FILE" ] || error_exit "未找到节点信息，请先选择 1 安装"
+    cat "$SHARE_FILE"
+}
+
+manager_restart() {
+    manager_require_platform
+    [ -f "$XRAY_CONFIG" ] || error_exit "尚未安装，请先选择 1"
+    if [ "$XRAY_PLATFORM" = alpine ]; then
+        [ -f /etc/local.d/xray.start ] || error_exit "缺少 Xray 启动文件"
+        sh /etc/local.d/xray.stop
+        sh /etc/local.d/xray.start
+        if [ -f /etc/local.d/clash-sub.start ]; then
+            sh /etc/local.d/clash-sub.start
+        fi
+    else
+        systemctl restart xray.service
+        if [ -f /etc/systemd/system/xray-clash-sub.service ]; then
+            systemctl restart xray-clash-sub.service
+        fi
+    fi
+    echo "已执行 Xray 和订阅服务重启。"
+}
+
+manager_logs() {
+    if [ -f /etc/alpine-release ]; then
+        for manager_log in /var/log/xray.log /var/log/xray-clash-sub.log; do
+            if [ -f "$manager_log" ]; then
+                printf '\n%s\n' "$manager_log"
+                tail -n 60 "$manager_log"
+            fi
+        done
+    else
+        journalctl -u xray.service -u xray-clash-sub.service -n 80 --no-pager
+    fi
+}
+
+manager_dispatch() (
+    set -eu
+    umask 077
+    manager_require_root
+    case "$1" in
+        1) manager_install ;;
+        2|3|6)
+            manager_require_platform
+            [ -f "$XRAY_CONFIG" ] && [ -f "$SHARE_FILE" ] ||
+                error_exit "尚未找到本项目节点。请先选择 1 安装；安装向导可导入证书备份。"
+            case "$1" in
+                3) CLASH_SUB_HTTPS=cloudflare ;;
+                6)
+                    CLASH_SUB_CERT_BUNDLE=$(manager_read '要导入的证书备份路径 [.p12]: ') || exit 1
+                    [ -n "$CLASH_SUB_CERT_BUNDLE" ] || error_exit "备份路径不能为空"
+                    CLASH_SUB_HTTPS=import ;;
+            esac
+            update_subscription ;;
+        4) run_diagnostic ;;
+        5)
+            manager_bundle=$(manager_read '导出路径 [/root/sub-cert.p12]: ') || exit 1
+            subscription_export_certificate "${manager_bundle:-/root/sub-cert.p12}" ;;
+        7) manager_show_client ;;
+        8) manager_restart ;;
+        9) manager_logs ;;
+        *) error_exit "无效选项，请选择 0–9" ;;
+    esac
+)
+
+manager_menu() {
+    cat <<'MENU'
+
+==========================================
+          Xray Reality 管理
+==========================================
+  1. 安装 / 重新安装 Xray
+  2. 更新订阅（保留节点、口令与 HTTPS 配置）
+  3. 配置 HTTPS / 接入证书自动续期
+  4. 连接诊断（超时 / 延迟 -1ms）
+  5. 导出加密证书备份
+  6. 导入证书到已有节点
+  7. 查看节点参数与订阅地址
+  8. 重启 Xray 和订阅服务
+  9. 查看最近日志
+  0. 退出
+MENU
+}
+
+manager_main() {
+    case "${1:-}" in
+        --help|-h)
+            echo "用法：sh xray.sh [0–9]"
+            echo "无参数进入菜单；也可直接指定菜单编号。Alpine 与 Debian 使用同一个文件。"
+            manager_menu
+            return 0 ;;
+    esac
+    [ "$#" -le 1 ] || { echo "只接受一个菜单编号；使用 --help 查看帮助" >&2; return 1; }
+    case "${1:-}" in
+        ''|[0-9]) ;;
+        *) echo "无效选项；使用 sh xray.sh --help 查看帮助" >&2; return 1 ;;
+    esac
+    # 终端优先；无终端时支持从 stdin 读取编号，EOF 正常退出。
+    if ( : </dev/tty ) 2>/dev/null; then
+        exec 9<>/dev/tty
+    else
+        exec 9<&0
+    fi
+    if [ "$#" -eq 1 ]; then
+        [ "$1" != 0 ] || return 0
+        manager_dispatch "$1"
+        return $?
+    fi
+    while :; do
+        manager_menu
+        manager_choice=$(manager_read '请选择 [0–9]: ') || break
+        case "$manager_choice" in
+            0) break ;;
+            [1-9])
+                manager_dispatch "$manager_choice"
+                manager_result=$?
+                if [ "$manager_result" -ne 0 ]; then
+                    echo "操作未完成（退出码 $manager_result），请查看上方提示。"
+                fi ;;
+            *) echo "无效选项，请输入 0–9。" ;;
+        esac
+    done
+}
+
+manager_main "$@"
