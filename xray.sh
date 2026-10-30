@@ -1043,8 +1043,8 @@ $V2RAYN_SUB_URL
       链接含随机口令，不要发给别人
 
 本地配置:
-  Clash Meta: $CLASH_FILE
-  Xray / NekoBox: $XRAY_CLIENT_FILE
+  Clash Meta: ${SUBSCRIPTION_LIVE_CLASH_FILE:-$CLASH_FILE}
+  Xray / NekoBox: ${SUBSCRIPTION_LIVE_XRAY_CLIENT_FILE:-$XRAY_CLIENT_FILE}
   规则来源: https://github.com/ACL4SSR/ACL4SSR
 NOTE
     fi
@@ -1508,7 +1508,7 @@ prompt_input() {
     prompt_msg="$1"
     default_val="${2-}"
     ans=""
-    if [ -r /dev/tty ]; then
+    if ( : </dev/tty ) 2>/dev/null; then
         if [ -n "$default_val" ]; then
             printf "%s [%s]: " "$prompt_msg" "$default_val" > /dev/tty
         else
@@ -1565,7 +1565,7 @@ validate_socks_password() {
 prompt_socks_credentials() {
     # 交互循环直到合法；非交互则一次失败即退出
     interactive=0
-    [ -r /dev/tty ] && interactive=1
+    if ( : </dev/tty ) 2>/dev/null; then interactive=1; fi
 
     tries=0
     while :; do
@@ -1642,7 +1642,7 @@ configure_socks_optional() {
     if is_truthy "$_socks_enable_in"; then
         choice="y"
         echo "检测到 ENABLE_SOCKS=$_socks_enable_in，将启用 SOCKS5"
-    elif [ ! -r /dev/tty ]; then
+    elif ! ( : </dev/tty ) 2>/dev/null; then
         choice="n"
         echo "非交互安装且未设置 ENABLE_SOCKS，跳过 SOCKS5"
     else
@@ -1660,9 +1660,9 @@ configure_socks_optional() {
     ENABLE_SOCKS=1
 
     # 端口：交互可改；非交互用环境变量/默认
-    if [ -r /dev/tty ] && ! is_truthy "$_socks_enable_in"; then
+    if ( : </dev/tty ) 2>/dev/null && ! is_truthy "$_socks_enable_in"; then
         SOCKS_PORT=$(prompt_input "SOCKS5 端口" "${SOCKS_PORT:-10808}")
-    elif [ -r /dev/tty ] && [ "$_socks_port_in" = "10808" ]; then
+    elif ( : </dev/tty ) 2>/dev/null && [ "$_socks_port_in" = "10808" ]; then
         # 环境只开了开关、没改端口时，仍允许确认/修改
         SOCKS_PORT=$(prompt_input "SOCKS5 端口" "10808")
     fi
@@ -2917,9 +2917,9 @@ SCORE_OK=0
 SCORE_WARN=0
 SCORE_BAD=0
 
-ok() { echo -e "${GREEN}✅ $1${NC}"; SCORE_OK=$((SCORE_OK + 1)); }
-warn() { echo -e "${YELLOW}⚠️  $1${NC}"; SCORE_WARN=$((SCORE_WARN + 1)); }
-bad() { echo -e "${RED}❌ $1${NC}"; SCORE_BAD=$((SCORE_BAD + 1)); }
+ok() { printf '%b%s%b\n' "$GREEN" "✅ $1" "$NC"; SCORE_OK=$((SCORE_OK + 1)); }
+warn() { printf '%b%s%b\n' "$YELLOW" "⚠️  $1" "$NC"; SCORE_WARN=$((SCORE_WARN + 1)); }
+bad() { printf '%b%s%b\n' "$RED" "❌ $1" "$NC"; SCORE_BAD=$((SCORE_BAD + 1)); }
 
 if [ ! -f "$XRAY_CONFIG" ]; then
     bad "未找到配置文件: $XRAY_CONFIG"
@@ -2927,18 +2927,31 @@ if [ ! -f "$XRAY_CONFIG" ]; then
     exit 1
 fi
 
-XRAY_PORT=$(sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$XRAY_CONFIG" | head -1)
-SNI=$(sed -n 's/.*"serverNames"[[:space:]]*:[[:space:]]*\[[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
-PRIV_KEY=$(sed -n 's/.*"privateKey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
-SHORT_ID=$(sed -n 's/.*"shortIds"[[:space:]]*:[[:space:]]*\[[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
-# shortIds 可能以 "" 开头，再取下一个非空
-if [ -z "$SHORT_ID" ]; then
-    SHORT_ID=$(grep -o '"shortIds"[[:space:]]*:[[:space:]]*\[[^]]*\]' "$XRAY_CONFIG" | head -1 | grep -o '"[0-9a-fA-F]*"' | tr -d '"' | grep -v '^$' | head -1)
-fi
-DEST=$(sed -n 's/.*"dest"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
-UUID=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
-LISTEN=$(sed -n 's/.*"listen"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
-FLOW=$(sed -n 's/.*"flow"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_CONFIG" | head -1)
+command -v python3 >/dev/null || { bad "缺少 python3，无法读取 JSON 配置"; exit 1; }
+diagnostic_fields=$(python3 - "$XRAY_CONFIG" <<'PY'
+import json
+from pathlib import Path
+import shlex
+import sys
+try:
+    config = json.loads(Path(sys.argv[1]).read_text())
+    node = next(v for v in config.get('inbounds', []) if v.get('protocol') == 'vless'
+                and v.get('streamSettings', {}).get('security') == 'reality')
+    reality = node['streamSettings']['realitySettings']
+    client = next(iter(node.get('settings', {}).get('clients', [])), {})
+    fields = dict(XRAY_PORT=node.get('port', 52300),
+                  SNI=next(iter(reality.get('serverNames', [])), ''),
+                  PRIV_KEY=reality.get('privateKey', ''),
+                  SHORT_ID=next((v for v in reality.get('shortIds', []) if v), ''),
+                  DEST=reality.get('target') or reality.get('dest', ''),
+                  UUID=client.get('id', ''), FLOW=client.get('flow', ''), LISTEN=node.get('listen', ''))
+    for key, value in fields.items():
+        print(key+'='+shlex.quote(str(value)))
+except (OSError, ValueError, KeyError, StopIteration):
+    sys.exit('配置 JSON 无效或找不到 Reality 入站。')
+PY
+) || { bad "无法读取 Reality 配置"; exit 1; }
+eval "$diagnostic_fields"
 
 [ -z "$XRAY_PORT" ] && XRAY_PORT="52300"
 XRAY_PUBLIC_PORT=$(sed -n 's/^NODE_PUBLIC_PORT=\([0-9][0-9]*\)$/\1/p' "$XRAY_DIR/clash-sub.env" 2>/dev/null | head -n 1)
@@ -3305,14 +3318,14 @@ echo "  lxc config device add <实例> xrayproxy proxy listen=tcp:0.0.0.0:$XRAY_
 echo "  # 返回管理菜单，选择 4 重新诊断；订阅问题选择 2 或 3"
 echo ""
 if [ "$SCORE_BAD" -gt 0 ]; then
-    echo -e "${RED}结论: 发现 $SCORE_BAD 个严重问题，优先处理后再测客户端。${NC}"
+    printf '%b%s%b\n' "$RED" "结论: 发现 $SCORE_BAD 个严重问题，优先处理后再测客户端。" "$NC"
     exit 2
 fi
 if [ "$SCORE_WARN" -gt 0 ]; then
-    echo -e "${YELLOW}结论: 服务可能已起来，但仍有 $SCORE_WARN 个警告；若仍 -1ms，重点查安全组与端口映射。${NC}"
+    printf '%b%s%b\n' "$YELLOW" "结论: 服务可能已起来，但仍有 $SCORE_WARN 个警告；若仍 -1ms，重点查安全组与端口映射。" "$NC"
     exit 0
 fi
-echo -e "${GREEN}结论: 本机侧未见明显异常。若客户端仍 -1ms，基本可断定是安全组/NAT 映射/客户端参数问题。${NC}"
+printf '%b%s%b\n' "$GREEN" "结论: 本机侧未见明显异常。若客户端仍 -1ms，基本可断定是安全组/NAT 映射/客户端参数问题。" "$NC"
 echo "=========================================="
 echo "✅ 诊断完成"
 echo "=========================================="
@@ -3529,6 +3542,9 @@ try:
     for number in set(ports) - old_ports:
         try:
             with socket.socket() as probe:
+                # Match service binding behavior: recently closed connections
+                # in TIME_WAIT must not prevent restoring the previous port.
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 probe.bind(('0.0.0.0', number))
         except OSError:
             raise ValueError('新监听端口已被占用或无法绑定：'+str(number))
@@ -3697,6 +3713,7 @@ manager_edit_config() (
         SHARE_FILE="$config_tmp/client-link.txt"
         SUB_ENV="$config_tmp/clash-sub.env"
         SUBSCRIPTION_LIVE_CLASH_FILE="$XRAY_DIR/clash-meta.yaml"
+        SUBSCRIPTION_LIVE_XRAY_CLIENT_FILE="$XRAY_DIR/xray-client.json"
         SUBSCRIPTION_LIVE_V2RAYN_FILE="$XRAY_DIR/v2rayn.txt"
         write_client_routing_files
     ) > "$config_tmp/generated.log"
