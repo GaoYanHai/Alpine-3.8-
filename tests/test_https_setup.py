@@ -34,7 +34,8 @@ class HttpsSetupTest(unittest.TestCase):
     def run_shell(self, code, values=None, source=None):
         env = os.environ.copy()
         for name in ('CF_Token', 'CLASH_SUB_HTTPS', 'CLASH_SUB_HOST', 'CLASH_SUB_PUBLIC_PORT',
-                     'CLASH_SUB_TLS_CERT', 'CLASH_SUB_TLS_KEY'):
+                     'CLASH_SUB_TLS_CERT', 'CLASH_SUB_TLS_KEY', 'CLASH_SUB_CERT_BUNDLE',
+                     'CERT_BUNDLE_PASSWORD'):
             env.pop(name, None)
         env.update(SSL_CERT_FILE=self.cert.as_posix(), PYTHONIOENCODING='utf-8')
         assignments = dict(CLASH_SUB_PORT='58472', PORT='52300', CLEAR_IP='203.0.113.10')

@@ -4,15 +4,21 @@ set -eu
 umask 077
 
 case "${1:-}" in
-    --https) CLASH_SUB_HTTPS=cloudflare ;;
+    --https) [ "$#" -eq 1 ] || exit 1; CLASH_SUB_HTTPS=cloudflare ;;
+    --export-cert|--import-cert)
+        [ "$#" -eq 2 ] || { echo "用法: bash subscription-update.sh $1 /root/sub-cert.p12" >&2; exit 1; }
+        if [ "$1" = --import-cert ]; then
+            CLASH_SUB_HTTPS=import
+            CLASH_SUB_CERT_BUNDLE="$2"
+        fi ;;
     --help|-h)
-        echo "用法: bash subscription-update.sh [--https]"
+        echo "用法: bash subscription-update.sh [--https | --export-cert 备份.p12 | --import-cert 备份.p12]"
         echo "默认保留原订阅域名、证书、端口和口令；--https 启动 Cloudflare DNS-01 HTTPS 向导。"
+        echo "--export-cert 仅导出加密证书包；--import-cert 导入证书并更新订阅 HTTPS，不修改 Xray。"
         exit 0 ;;
     '') ;;
     *) echo "未知参数，使用 --help 查看用法" >&2; exit 1 ;;
 esac
-[ "$#" -le 1 ] || { echo "参数过多" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || { echo "请以 root 运行" >&2; exit 1; }
 for cmd in python3 base64; do
@@ -55,6 +61,14 @@ if 'V2RAYN_SUB_FILE' not in block or 'CLASH_SUB_TLS_CERT' not in block:
 Path(sys.argv[2]).write_text(block)
 PY
 bash -n "$task_tmp/functions.sh"
+
+# Export only needs the certificate settings, including when the old node is down.
+if [ "${1:-}" = --export-cert ]; then
+    . "$task_tmp/functions.sh"
+    command -v subscription_export_certificate >/dev/null || { echo "请同步更新安装脚本" >&2; exit 1; }
+    subscription_export_certificate "$2"
+    exit $?
+fi
 
 # 使用 shlex 编码后再读取，节点或环境文件中的内容不能成为 shell 命令。
 python3 - "$XRAY_CONFIG" "$SHARE_FILE" "$SUB_ENV" > "$task_tmp/node.env" <<'PY'

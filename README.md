@@ -130,7 +130,7 @@ chmod +x debian_xray_improved.sh
 sudo bash debian_xray_improved.sh
 ```
 
-两个安装脚本都包含订阅向导，单文件运行即可。交互安装时会提示选择 **Cloudflare 自动申请 HTTPS（默认选项）**、已有公开证书或 HTTP。选择自动申请后，按提示填写完整域名、公网订阅端口、设置 Cloudflare 灰云 A 记录与 NAT 映射，再隐藏输入 API Token；脚本自动安装 acme.sh、申请证书、配置续期和订阅服务，最后验证本机订阅。
+两个安装脚本都包含订阅向导，单文件运行即可。交互安装时会提示选择 **Cloudflare 自动申请 HTTPS（默认选项）**、已有公开证书、HTTP 或导入加密证书备份。选择自动申请后，按提示填写完整域名、公网订阅端口、设置 Cloudflare 灰云 A 记录与 NAT 映射，再隐藏输入 API Token；脚本自动安装 acme.sh、申请证书、配置续期和订阅服务，最后验证本机订阅。换机复用证书见下方「证书导出、导入与 NAT 换机」。
 
 无交互终端且未指定 HTTPS 参数时，脚本保持 HTTP 并打印后续开启方法。域名托管在 Cloudflare 并不等于 VPS 已有可供客户端直接信任的证书，具体权限和步骤见下方「NAT VPS + Cloudflare 域名启用 HTTPS」。
 
@@ -301,16 +301,70 @@ bash subscription-update.sh
 
 | 变量 | 默认 / 用途 |
 |------|-------------|
-| `CLASH_SUB_HTTPS` | `auto`：复用已有证书，或启动交互选择；`cloudflare`：自动签发；`existing`：自有证书；`off`：HTTP（已有 TLS 时拒绝直接降级） |
+| `CLASH_SUB_HTTPS` | `auto`：复用已有证书，或启动交互选择；`cloudflare`：自动签发；`existing`：自有证书；`import`：导入加密证书备份；`off`：HTTP（已有 TLS 时拒绝直接降级） |
 | `CLASH_SUB_HOST` | 完整订阅域名；auto 模式下设置域名且无证书时进入 Cloudflare 自动签发 |
 | `CLASH_SUB_PORT` | 订阅监听端口，默认 `58472` |
 | `CLASH_SUB_PUBLIC_PORT` | NAT 公网订阅端口，默认等于监听端口，写入生成的 URL |
 | `CLASH_SUB_TLS_CERT` / `CLASH_SUB_TLS_KEY` | existing 模式的 PEM 完整证书链和私钥路径；设置两者时 auto 自动复用 |
 | `CF_Token` | Cloudflare 自动签发时可从环境提供；未设置时隐藏输入，非交互运行必须提供 |
+| `CLASH_SUB_CERT_BUNDLE` | 待导入的 `.p12` 路径；设置后 auto 模式进入证书导入 |
+| `CERT_BUNDLE_PASSWORD` | 无人值守导出/导入时可通过环境提供密码；交互时隐藏输入，导出需确认两次，至少 8 个字符 |
 
 无人值守示例：从安全的本机环境预先导出 `CF_Token`，完成 DNS/NAT 后运行 `CLASH_SUB_HTTPS=cloudflare CLASH_SUB_HOST=sub.example.com bash debian_xray_improved.sh`；Alpine 换成 `sh alpine_xray_improved.sh`。不要将真实 Token 写入公开命令示例或提交到仓库。
 
 如以后改用 Cloudflare 代理，需使用它支持的 HTTPS 端口（例如 443 或 8443），SSL/TLS 设为 Full (strict)，并正确映射到启用 TLS 的订阅服务；58472 不在常规代理支持范围。
+
+#### 证书导出、导入与 NAT 换机
+
+证书可以跟随同一域名迁移到新 VPS，不必每次换 NAT 小鸡都重新签发。请在旧 VPS 还能登录时提前导出，下载到自己的电脑保存；旧机器丢失后，没有备份就无法从它恢复私钥。
+
+先按「已安装 VPS 更新订阅」中的命令同步下载最新版 `subscription-update.sh` 和对应系统安装脚本。导出操作不要求 Xray 正在运行，也不会重装或重启节点：
+
+```bash
+cd /root/xray-sub-update
+bash subscription-update.sh --export-cert /root/sub-cert.p12
+```
+
+按提示输入两次备份密码。生成的是加密 PKCS#12 文件，包含完整证书链和私钥，采用 AES-256-CBC、SHA-256 MAC 和 200000 次密码迭代；文件仅 root 可读写。已有同名文件会拒绝覆盖。请使用较长的独立密码，将 `.p12` 下载到电脑保存，勿放在订阅网站公开目录，密码遗失无法恢复。
+
+备份**不包含 Cloudflare Token、ACME 续期账户、Xray 节点配置或订阅口令**。导入只复用证书，不等于恢复整个旧节点；证书有效期也不会因导入而延长。
+
+将备份通过 SSH/SFTP 上传到新 VPS，例如 `/root/sub-cert.p12`，然后根据新 VPS 状态选择：
+
+| 新 VPS 状态 | 操作 |
+|------------|------|
+| 尚未安装 Xray | 下载最新版 Debian/Alpine 安装脚本，安装时选择向导第 4 项「导入加密证书备份」，或使用下方参数 |
+| 已安装本项目 Xray | 下载最新版更新工具和对应安装脚本，再执行 `bash subscription-update.sh --import-cert /root/sub-cert.p12` |
+
+新机器直接安装并导入（两条命令择一）：
+
+```bash
+# Debian：正常安装新节点，HTTPS 复用备份里的证书
+bash debian_xray_improved.sh --import-cert /root/sub-cert.p12
+
+# Alpine
+sh alpine_xray_improved.sh --import-cert /root/sub-cert.p12
+```
+
+输入备份密码后，脚本校验证书链、公私钥、域名和剩余有效期（须超过 24 小时），成功后写入 `/etc/xray/tls/import-*/` 独立目录，避免覆盖现有工作证书。错误密码、损坏文件、证书不受信任、域名不符或即将过期都会停止导入。域名默认从本项目备份中读取；如果要选择同一证书覆盖的其他域名，可显式设置：
+
+```bash
+CLASH_SUB_HOST=sub.example.com \
+bash subscription-update.sh --import-cert /root/sub-cert.p12
+```
+
+换机后还需要完成：
+
+1. 将 Cloudflare 灰云 A 记录改为新 NAT 宿主机公网 IP，并确认新机器订阅 TCP 端口的 NAT 映射和安全组。
+2. 使用新机器打印的订阅地址；新安装的节点参数和随机订阅口令可能不同，导入证书不会保留旧订阅 URL。已有节点使用更新工具导入时，保留该机器的订阅口令和节点。
+3. 在新机器运行 `bash subscription-update.sh --https` 并输入 Cloudflare Token，接入自动续期。仅导入 `.p12` 不会自动建立续期账户和任务；在重新接入前，证书只能使用到原来的到期时间。若通过单文件安装脚本安装，请先下载上方更新工具。
+
+两个安装脚本也支持单独导出，以下操作会在进入安装流程前退出：
+
+```bash
+bash debian_xray_improved.sh --export-cert /root/sub-cert.p12
+# Alpine: sh alpine_xray_improved.sh --export-cert /root/sub-cert.p12
+```
 
 同一节点出现 YAML 慢、VLESS 快时，先在 YAML 的 GLOBAL 分组明确选择同一节点进行对照，再观察实际视频连接与下载速度。全局模式仍沿用 YAML 的 DNS；YouTube 的 Connection Speed 是分段下载估算值，单次波动不能证明规则或内核限速。持续慢时应记录相同视频、清晰度、实际命中节点和测速时间，再比较两个内核。
 

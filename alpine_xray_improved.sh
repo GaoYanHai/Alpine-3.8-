@@ -22,7 +22,7 @@ set -u  # 未定义变量时报错
 # 0. 自定义基础变量
 PORT=52300
 CLASH_SUB_PORT="${CLASH_SUB_PORT:-58472}"   # Clash / v2rayN 订阅端口
-CLASH_SUB_HTTPS="${CLASH_SUB_HTTPS:-auto}" # auto/cloudflare/existing/off
+CLASH_SUB_HTTPS="${CLASH_SUB_HTTPS:-auto}" # auto/cloudflare/existing/import/off
 CLASH_SUB_PUBLIC_PORT="${CLASH_SUB_PUBLIC_PORT:-}" # NAT 外部端口，默认等于监听端口
 CLASH_SUB_HOST="${CLASH_SUB_HOST:-}"       # 可选：订阅域名，不改变 Reality 节点地址
 CLASH_SUB_TLS_CERT="${CLASH_SUB_TLS_CERT:-}" # 可选：PEM 完整证书链
@@ -1187,42 +1187,205 @@ PY
     echo "✅ 已配置每日续期检查，证书更新后自动重启订阅服务。"
 )
 
+subscription_certificate_bundle() {
+    # PKCS#12 encrypts the certificate and private key. Passwords never enter argv.
+    python3 - "$@" <<'PY'
+import getpass
+import os
+from pathlib import Path
+import re
+import ssl
+import subprocess
+import sys
+import tempfile
+
+def command(args, data=None):
+    result = subprocess.run(['openssl', *args], input=data, capture_output=True)
+    if result.returncode:
+        raise ValueError('OpenSSL 操作失败：密码错误、备份损坏或证书无效。')
+    return result.stdout
+
+def valid_host(host):
+    return len(host) <= 253 and '.' in host and all(re.fullmatch(
+        r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', part) for part in host.split('.'))
+
+def write_private(path, data):
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as output:
+        output.write(data)
+
+def password(action):
+    value = os.environ.get('CERT_BUNDLE_PASSWORD')
+    if value is None:
+        with open('/dev/tty', 'w') as tty:
+            if not tty.isatty():
+                raise ValueError('无终端：请通过 CERT_BUNDLE_PASSWORD 环境变量提供备份密码。')
+            value = getpass.getpass('证书备份密码（隐藏输入）: ', stream=tty)
+            if action == 'export' and value != getpass.getpass('再次输入备份密码: ', stream=tty):
+                raise ValueError('两次密码不一致。')
+    if len(value) < 8 or '\n' in value or '\r' in value or '\0' in value:
+        raise ValueError('备份密码至少 8 个字符，不能含换行或 NUL。')
+    return (value+'\n').encode('utf-8')
+
+try:
+    action, bundle, host, cert, key = sys.argv[1:]
+    path = Path(bundle).expanduser()
+    if action == 'export':
+        if path.exists() or path.is_symlink():
+            raise ValueError('备份文件已存在，请指定新文件名，避免覆盖。')
+        secret = password(action)
+        data = command(['pkcs12', '-export', '-in', cert, '-inkey', key,
+                        '-name', host, '-keypbe', 'AES-256-CBC', '-certpbe', 'AES-256-CBC',
+                        '-macalg', 'sha256', '-iter', '200000', '-passout', 'stdin'], secret)
+        write_private(path, data)
+        print('✅ 已导出加密证书备份: '+str(path))
+        print('请把备份下载到本机保存；文件含私钥，密码遗失无法恢复。')
+        print('备份仅包含证书链和私钥，不包含 Cloudflare Token、节点参数或订阅口令。')
+    elif action == 'import':
+        if not path.is_file() or path.stat().st_size > 2*1024*1024:
+            raise ValueError('备份不存在或超过 2 MiB。')
+        secret = password(action)
+        with tempfile.TemporaryDirectory(prefix='xray-cert-') as tmp:
+            folder = Path(tmp)
+            leaf = command(['pkcs12', '-in', str(path), '-clcerts', '-nokeys', '-passin', 'stdin'], secret)
+            chain = command(['pkcs12', '-in', str(path), '-cacerts', '-nokeys', '-passin', 'stdin'], secret)
+            raw_key = command(['pkcs12', '-in', str(path), '-nocerts', '-nodes', '-passin', 'stdin'], secret)
+            pattern = rb'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----'
+            leaves = re.findall(pattern, leaf, re.S)
+            if len(leaves) != 1:
+                raise ValueError('备份应包含一个站点证书及对应私钥。')
+            pem = b'\n'.join(leaves+re.findall(pattern, chain, re.S))+b'\n'
+            staged_cert, staged_key = folder/'fullchain.pem', folder/'key.pem'
+            write_private(staged_cert, pem)
+            write_private(staged_key, command(['pkey'], raw_key))
+            if not host:
+                # Our exports store the exact hostname as the PKCS#12 friendly name.
+                names = re.findall(rb'^\s*friendlyName: ([^\r\n]+)', leaf, re.M)
+                if names:
+                    candidate = names[0].decode('utf-8')
+                    if valid_host(candidate):
+                        host = candidate
+                if not host:
+                    san = command(['x509', '-in', str(staged_cert), '-noout', '-ext', 'subjectAltName'])
+                    host = next((v for v in re.findall(r'DNS:([^,\s]+)', san.decode('utf-8'))
+                                 if valid_host(v)), '')
+            if not valid_host(host):
+                raise ValueError('请通过 CLASH_SUB_HOST 指定证书对应的完整域名。')
+            ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(staged_cert, staged_key)
+            command(['x509', '-in', str(staged_cert), '-noout', '-checkend', '86400'])
+            command(['verify', '-purpose', 'sslserver', '-verify_hostname', host,
+                     '-untrusted', str(staged_cert), str(staged_cert)])
+            # Only publish validated files; use a unique directory so failed imports
+            # cannot overwrite an existing working certificate or its renewal targets.
+            target = Path(cert)
+            target.mkdir(mode=0o700, parents=True, exist_ok=True)
+            installed = Path(tempfile.mkdtemp(prefix='import-', dir=target))
+            try:
+                write_private(installed/'fullchain.pem', pem)
+                write_private(installed/'key.pem', staged_key.read_bytes())
+            except BaseException:
+                for item in installed.iterdir():
+                    item.unlink()
+                installed.rmdir()
+                raise
+            # Fixed three-line output is consumed by the shell, never evaluated.
+            print(host)
+            print(installed/'fullchain.pem')
+            print(installed/'key.pem')
+    else:
+        raise ValueError('未知证书操作。')
+except (OSError, ValueError, ssl.SSLError) as error:
+    sys.exit('证书'+('导出' if sys.argv[1:2] == ['export'] else '导入')+'失败: '+str(error))
+PY
+}
+
+subscription_export_certificate() (
+    set +x
+    umask 077
+    [ "$(id -u)" = 0 ] || { echo "请以 root 运行" >&2; exit 1; }
+    for sub_cmd in python3 openssl; do
+        command -v "$sub_cmd" >/dev/null || { echo "缺少依赖: $sub_cmd" >&2; exit 1; }
+    done
+    # Only read data from the subscription env file; never source it as shell code.
+    sub_saved_tls=$(python3 - <<'PY'
+import os
+from pathlib import Path
+import shlex
+values = {}
+path = Path('/etc/xray/clash-sub.env')
+allowed = ('CLASH_SUB_HOST', 'CLASH_SUB_TLS_CERT', 'CLASH_SUB_TLS_KEY')
+if path.is_file():
+    for line in path.read_text().splitlines():
+        key, sep, value = line.partition('=')
+        if sep and key in allowed:
+            values[key] = value.strip()
+for key in allowed:
+    print(key+'='+shlex.quote(os.environ.get(key) or values.get(key, '')))
+PY
+    ) || exit 1
+    eval "$sub_saved_tls"
+    [ -n "$CLASH_SUB_HOST$CLASH_SUB_TLS_CERT$CLASH_SUB_TLS_KEY" ] || { echo "没有可导出的 HTTPS 证书" >&2; exit 1; }
+    subscription_validate_tls || { echo "当前证书未通过校验，停止导出" >&2; exit 1; }
+    subscription_certificate_bundle export "$1" "$CLASH_SUB_HOST" "$CLASH_SUB_TLS_CERT" "$CLASH_SUB_TLS_KEY"
+)
+
+subscription_import_certificate() {
+    sub_imported=$(subscription_certificate_bundle import "$CLASH_SUB_CERT_BUNDLE" \
+        "$CLASH_SUB_HOST" /etc/xray/tls "") || error_exit "证书导入失败，原证书和订阅配置未改动"
+    CLASH_SUB_HOST=$(printf '%s\n' "$sub_imported" | sed -n '1p')
+    CLASH_SUB_TLS_CERT=$(printf '%s\n' "$sub_imported" | sed -n '2p')
+    CLASH_SUB_TLS_KEY=$(printf '%s\n' "$sub_imported" | sed -n '3p')
+    echo "✅ 已导入 $CLASH_SUB_HOST 的证书，无需重新申请。"
+    echo "迁移后请将 Cloudflare 灰云 A 记录改为新 NAT 公网 IP，确认公网订阅端口映射。"
+    echo "证书备份不含续期账户/Token。请运行 bash subscription-update.sh --https，重新接入自动续期。"
+    echo "新节点参数和订阅口令以本机输出为准；证书导入不会恢复旧节点或旧订阅地址。"
+}
+
 configure_subscription_https() {
     CLASH_SUB_HTTPS="${CLASH_SUB_HTTPS:-auto}"
     CLASH_SUB_HOST="${CLASH_SUB_HOST:-}"
     CLASH_SUB_TLS_CERT="${CLASH_SUB_TLS_CERT:-}"
     CLASH_SUB_TLS_KEY="${CLASH_SUB_TLS_KEY:-}"
     CLASH_SUB_PUBLIC_PORT="${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT}"
+    CLASH_SUB_CERT_BUNDLE="${CLASH_SUB_CERT_BUNDLE:-}"
     sub_https_reuse=0
     # This subshell check avoids a fatal /dev/tty redirection in noninteractive sh.
     if ( : </dev/tty ) 2>/dev/null; then
         exec 3<>/dev/tty
     fi
     if [ "$CLASH_SUB_HTTPS" = auto ]; then
-        if [ -n "$CLASH_SUB_TLS_CERT$CLASH_SUB_TLS_KEY" ]; then
+        if [ -n "$CLASH_SUB_CERT_BUNDLE" ]; then
+            CLASH_SUB_HTTPS=import
+        elif [ -n "$CLASH_SUB_TLS_CERT$CLASH_SUB_TLS_KEY" ]; then
             CLASH_SUB_HTTPS=existing
             sub_https_reuse=1
         elif [ -n "$CLASH_SUB_HOST" ]; then
             CLASH_SUB_HTTPS=cloudflare
         elif [ -t 3 ] 2>/dev/null; then
-            echo "订阅访问方式：1) Cloudflare 自动申请 HTTPS（推荐） 2) 已有公开证书 3) HTTP"
+            echo "订阅访问方式：1) Cloudflare 自动申请 HTTPS（推荐） 2) 已有公开证书 3) HTTP 4) 导入加密证书备份"
             sub_choice=$(subscription_prompt "请选择" 1) || error_exit "订阅向导已中断"
             case "$sub_choice" in
                 1) CLASH_SUB_HTTPS=cloudflare ;;
                 2) CLASH_SUB_HTTPS=existing ;;
                 3) CLASH_SUB_HTTPS=off ;;
-                *) error_exit "无效选择，请重新运行并选择 1、2 或 3" ;;
+                4) CLASH_SUB_HTTPS=import ;;
+                *) error_exit "无效选择，请重新运行并选择 1、2、3 或 4" ;;
             esac
         else
             CLASH_SUB_HTTPS=off
             echo "无交互终端且未指定 HTTPS 参数：保持 HTTP。稍后可运行 bash subscription-update.sh --https。"
         fi
     fi
+    if [ "$CLASH_SUB_HTTPS" = import ]; then
+        if [ -z "$CLASH_SUB_CERT_BUNDLE" ]; then
+            CLASH_SUB_CERT_BUNDLE=$(subscription_prompt "证书备份包路径（.p12）" "") || error_exit "请设置 CLASH_SUB_CERT_BUNDLE"
+        fi
+        subscription_import_certificate
+    fi
     case "$CLASH_SUB_HTTPS" in
         off)
             [ -z "$CLASH_SUB_TLS_CERT$CLASH_SUB_TLS_KEY" ] || error_exit "已有 TLS 配置，不能用 off 静默降级；请保留 HTTPS"
             ;;
-        cloudflare|existing)
+        cloudflare|existing|import)
             if [ -z "$CLASH_SUB_HOST" ]; then
                 CLASH_SUB_HOST=$(subscription_prompt "完整订阅域名，例如 zor.zor.de5.net" "") || error_exit "请设置 CLASH_SUB_HOST"
             fi
@@ -1249,10 +1412,12 @@ configure_subscription_https() {
                     CLASH_SUB_TLS_KEY=$(subscription_prompt "私钥路径" /etc/xray/tls/key.pem) || error_exit "请设置 CLASH_SUB_TLS_KEY"
                 fi
                 subscription_validate_tls || error_exit "证书无效：请检查证书链、公私钥、域名和有效期；灰云直连不能使用 Origin CA"
-                echo "使用已有证书；请在原证书工具续期后重启订阅服务以加载证书。"
+                if [ "$CLASH_SUB_HTTPS" != import ]; then
+                    echo "使用已有证书；请在原证书工具续期后重启订阅服务以加载证书。"
+                fi
             fi
             ;;
-        *) error_exit "CLASH_SUB_HTTPS 仅支持 auto、cloudflare、existing、off" ;;
+        *) error_exit "CLASH_SUB_HTTPS 仅支持 auto、cloudflare、existing、import、off" ;;
     esac
     subscription_validate_options || error_exit "订阅域名或端口无效"
     exec 3>&-
@@ -1484,6 +1649,25 @@ configure_socks_optional() {
     echo "SOCKS5 will be added on 0.0.0.0:${SOCKS_PORT} (user=${SOCKS_USER})"
 }
 
+
+
+# Certificate export exits before installation, so it cannot recreate the node.
+case "${1:-}" in
+    --export-cert)
+        [ "$#" -eq 2 ] || error_exit "用法: $0 --export-cert /root/sub-cert.p12"
+        subscription_export_certificate "$2"
+        exit $? ;;
+    --import-cert)
+        [ "$#" -eq 2 ] || error_exit "用法: $0 --import-cert /root/sub-cert.p12"
+        CLASH_SUB_HTTPS=import
+        CLASH_SUB_CERT_BUNDLE="$2" ;;
+    --help|-h)
+        echo "用法: $0 [--import-cert 备份.p12 | --export-cert 备份.p12]"
+        echo "无参数：正常安装；--import-cert：安装时复用证书；--export-cert：仅导出证书，不安装。"
+        exit 0 ;;
+    '') ;;
+    *) error_exit "未知参数，使用 --help 查看用法" ;;
+esac
 
 # 1. 环境准备与依赖安装
 echo "正在安装基础依赖..."
@@ -1948,6 +2132,8 @@ $V2RAYN_SUB_URL
         链接带随机口令，不要发给别人、不要发到公开处
   规则: ACL4SSR_Online（配置在你自己的 VPS 上生成）
   本地备份: $CLASH_FILE
+  证书迁移: 使用最新版脚本 --export-cert /root/sub-cert.p12 导出加密备份
+            新机器安装时选「导入加密证书备份」，导入后按提示配置续期
 -------------------------------------------------------
 🚨 客户端延迟一直是 -1ms 时，按这个顺序查（90% 是前 3 项）:
   1) 云厂商安全组 / 防火墙是否放行 TCP $PORT 入站
