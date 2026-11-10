@@ -86,6 +86,35 @@ printf '%s|%s' "$status" "$following"
         result = subprocess.run([BASH, driver.as_posix()], input=b'\n7\n', capture_output=True)
         self.assertEqual(result.stdout, b'1|7')
 
+    def test_certificate_export_checks_final_filename_before_overwrite(self):
+        for name in ['112233', 'certificate with spaces', 'backup.pem']:
+            path = self.root/name
+            self.assertEqual(self.validate('certificate-output', path.as_posix()), 0)
+            final = Path(str(path)+'.p12')
+            final.write_text('existing backup')
+            self.assertNotEqual(self.validate('certificate-output', path.as_posix()), 0)
+            self.assertEqual(final.read_text(), 'existing backup')
+        self.assertNotEqual(self.validate('certificate-output', ''), 0)
+        self.assertNotEqual(self.validate('certificate-output', '   '), 0)
+        for name in ['existing.p12', 'existing.P12']:
+            path = self.root/name
+            path.write_text('existing backup')
+            self.assertNotEqual(self.validate('certificate-output', path.as_posix()), 0)
+
+    def test_certificate_export_prompt_returns_normalized_filename(self):
+        driver = self.root/'export-path.sh'
+        driver.write_text('''. "$(dirname "$0")/library.sh"
+exec 9<&0
+manager_read_default 'EXPORT' /root/sub-cert.p12 certificate-output
+''', encoding='utf-8')
+        for name, expected in [('112233', '112233.p12'), ('backup.p12', 'backup.p12'),
+                               ('backup.P12', 'backup.P12'), ('backup.pem', 'backup.pem.p12'),
+                               ('folder with spaces/backup', 'folder with spaces/backup.p12'),
+                               ('', '/root/sub-cert.p12')]:
+            result = subprocess.run([BASH, driver.as_posix()], input=(name+'\n').encode(), capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.decode(), expected)
+
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'Requires Linux PTY / termios')
 class TerminalTests(unittest.TestCase):

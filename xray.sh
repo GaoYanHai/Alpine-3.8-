@@ -1293,6 +1293,13 @@ input_read_line() (
     fi
 )
 
+certificate_export_path() {
+    case "$1" in
+        *.[pP]12) printf '%s' "$1" ;;
+        *) printf '%s.p12' "$1" ;;
+    esac
+}
+
 input_validate() (
     input_kind=$1
     input_value=$2
@@ -1346,7 +1353,10 @@ input_validate() (
         file)
             [ -f "$input_value" ] && [ -r "$input_value" ] && exit 0
             echo "文件不存在或不可读，请重新输入路径。" >&2 ;;
-        output)
+        output|certificate-output)
+            if [ "$input_kind" = certificate-output ]; then
+                input_value=$(certificate_export_path "$input_value")
+            fi
             [ ! -e "$input_value" ] && [ ! -L "$input_value" ] && exit 0
             echo "文件已存在，请换一个导出路径。" >&2 ;;
         token|tunnel-token|optional-tunnel-token)
@@ -1373,6 +1383,9 @@ input_prompt() (
         input_reply=$(input_read_line "$input_fd" "$input_label: " "$input_hidden") || exit $?
         [ -n "$input_reply" ] || input_reply=$input_default
         if input_validate "$input_type" "$input_reply"; then
+            if [ "$input_type" = certificate-output ]; then
+                input_reply=$(certificate_export_path "$input_reply")
+            fi
             printf '%s' "$input_reply"
             exit 0
         fi
@@ -1549,6 +1562,10 @@ subscription_setup_cloudflare() (
 subscription_certificate_bundle() (
     # PKCS#12 encrypts the certificate and private key. Passwords never enter argv.
     set +x
+    if [ "$1" = export ]; then
+        input_validate certificate-output "$2" || exit 1
+        set -- "$1" "$(certificate_export_path "$2")" "$3" "$4" "$5"
+    fi
     if [ "${CERT_BUNDLE_PASSWORD+x}" != x ]; then
         while :; do
             CERT_BUNDLE_PASSWORD=$(input_tty_prompt '证书备份密码（隐藏输入）' '' bundle-password 1) || exit 1
@@ -4633,7 +4650,7 @@ manager_dispatch() (
                 run_diagnostic
             fi ;;
         5)
-            manager_bundle=$(manager_read_default '导出路径' /root/sub-cert.p12 output) || exit 1
+            manager_bundle=$(manager_read_default '导出路径（自动补全 .p12）' /root/sub-cert.p12 certificate-output) || exit 1
             subscription_export_certificate "$manager_bundle" ;;
         7) manager_show_client ;;
         8) manager_restart ;;
