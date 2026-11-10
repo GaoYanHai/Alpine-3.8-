@@ -1110,17 +1110,294 @@ NOTE
     fi
 }
 
+# All prompts share terminal editing, validation and EOF handling.
+input_terminal_python() {
+    python3 - "$1" "$2" <<'PY'
+import codecs
+import os
+import select
+import signal
+import sys
+import termios
+import unicodedata
+
+fd, prompt, hidden = 8, sys.argv[1], sys.argv[2] == '1'
+previous = termios.tcgetattr(fd)
+current = termios.tcgetattr(fd)
+current[0] &= ~(termios.ICRNL | termios.INLCR | termios.IGNCR | termios.IXON | termios.ISTRIP)
+current[3] &= ~(termios.ICANON | termios.ECHO | termios.ECHONL | termios.ISIG | termios.IEXTEN)
+current[6][termios.VMIN], current[6][termios.VTIME] = 1, 0
+value, cursor = [], 0
+decoder = codecs.getincrementaldecoder('utf-8')('strict')
+
+def write(text):
+    os.write(fd, text.encode('utf-8'))
+
+def width(text):
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in text)
+
+def left(count):
+    if count:
+        write('\x1b['+str(count)+'D')
+
+def redraw_tail():
+    if not hidden:
+        tail = ''.join(value[cursor:])
+        write(tail+'\x1b[K')
+        left(width(tail))
+
+def interrupted(signum, frame):
+    raise SystemExit(130 if signum == signal.SIGINT else 143)
+
+for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(signum, interrupted)
+
+try:
+    termios.tcsetattr(fd, termios.TCSANOW, current)
+    write(prompt)
+    while True:
+        byte = os.read(fd, 1)
+        if not byte or byte == b'\x04' and not value:
+            raise SystemExit(1)
+        if byte in (b'\r', b'\n'):
+            write('\r\n')
+            sys.stdout.buffer.write(''.join(value).encode('utf-8'))
+            break
+        if byte == b'\x03':
+            write('\r\n')
+            raise SystemExit(130)
+        if byte in (b'\x08', b'\x7f'):
+            decoder.reset()
+            if cursor:
+                cursor -= 1
+                deleted = value.pop(cursor)
+                if not hidden:
+                    left(width(deleted))
+                    redraw_tail()
+            continue
+        if byte in (b'\x15', b'\x17'):
+            decoder.reset()
+            stop = 0
+            if byte == b'\x17':
+                stop = cursor
+                while stop and value[stop-1].isspace():
+                    stop -= 1
+                while stop and not value[stop-1].isspace():
+                    stop -= 1
+            if not hidden:
+                left(width(''.join(value[stop:cursor])))
+            del value[stop:cursor]
+            cursor = stop
+            redraw_tail()
+            continue
+        if byte == b'\x1b':
+            decoder.reset()
+            sequence = b''
+            while len(sequence) < 16 and select.select([fd], [], [], .08)[0]:
+                sequence += os.read(fd, 1)
+                if len(sequence) >= 2 and (sequence[-1:] == b'~' or sequence[-1:].isalpha()):
+                    break
+            if sequence in (b'[D', b'OD') and cursor:
+                cursor -= 1
+                if not hidden:
+                    left(width(value[cursor]))
+            elif sequence in (b'[C', b'OC') and cursor < len(value):
+                if not hidden:
+                    write(value[cursor])
+                cursor += 1
+            elif sequence == b'[3~' and cursor < len(value):
+                del value[cursor]
+                redraw_tail()
+            # Unknown terminal escape sequences never become literal input.
+            continue
+        if byte[0] < 32:
+            continue
+        try:
+            character = decoder.decode(byte)
+        except UnicodeDecodeError:
+            decoder.reset()
+            continue
+        if character and len(value) < 8192:
+            value.insert(cursor, character)
+            cursor += 1
+            if not hidden:
+                write(character)
+                redraw_tail()
+finally:
+    termios.tcsetattr(fd, termios.TCSANOW, previous)
+PY
+}
+
+# Before Python is installed, only menu choices and numeric ports are requested.
+input_terminal_shell() (
+    LC_ALL=C
+    export LC_ALL
+    input_saved=$(stty -g <&8) || exit 1
+    trap 'stty "$input_saved" <&8' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    stty -icanon -echo -echonl -isig -iexten -ixon -icrnl -inlcr -igncr min 1 time 0 <&8 || exit 1
+    printf '%s' "$1" >&8
+    input_buffer=''
+    input_esc=''
+    input_bs=$(printf '\010')
+    input_del=$(printf '\177')
+    input_cr=$(printf '\r')
+    input_lf=$(printf '\nx'); input_lf=${input_lf%x}
+    while :; do
+        input_byte=$(dd bs=1 count=1 <&8 2>/dev/null; printf x)
+        input_byte=${input_byte%x}
+        case "$input_byte" in
+            ''|"$(printf '\004')") exit 1 ;;
+            "$(printf '\003')") printf '\r\n' >&8; exit 130 ;;
+            "$input_cr"|"$input_lf") printf '\r\n' >&8; printf '%s' "$input_buffer"; exit 0 ;;
+            "$(printf '\033')") input_esc=1; continue ;;
+        esac
+        if [ -n "$input_esc" ]; then
+            case "$input_byte" in [A-Za-z~]) input_esc='' ;; esac
+            continue
+        fi
+        case "$input_byte" in
+            "$input_bs"|"$input_del")
+                if [ -n "$input_buffer" ]; then
+                    input_buffer=${input_buffer%?}
+                    [ "$2" = 1 ] || printf '\b \b' >&8
+                fi ;;
+            "$(printf '\025')")
+                while [ -n "$input_buffer" ]; do
+                    input_buffer=${input_buffer%?}
+                    [ "$2" = 1 ] || printf '\b \b' >&8
+                done ;;
+            *)
+                # Ignore controls; the dependency-free prompts only accept ASCII.
+                if printf '%s' "$input_byte" | grep -q '[[:print:]]'; then
+                    input_buffer=$input_buffer$input_byte
+                    [ "$2" = 1 ] || printf '%s' "$input_byte" >&8
+                fi ;;
+        esac
+    done
+)
+
+input_read_line() (
+    exec 8<&"$1"
+    if [ -t 8 ]; then
+        if command -v python3 >/dev/null 2>&1; then
+            input_terminal_python "$2" "${3:-0}"
+        else
+            input_terminal_shell "$2" "${3:-0}"
+        fi
+    else
+        printf '%s' "$2" >&2
+        IFS= read -r input_line <&8 || exit 1
+        printf '%s' "$input_line"
+    fi
+)
+
+input_validate() (
+    input_kind=$1
+    input_value=$2
+    case "$input_kind" in
+        optional|optional-domain|optional-tunnel-token)
+            [ -n "$input_value" ] || exit 0 ;;
+    esac
+    if [ -z "$(printf '%s' "$input_value" | tr -d '[:space:]')" ]; then
+        echo "此项不能为空，请重新输入。" >&2
+        exit 1
+    fi
+    input_newline=$(printf '\nx'); input_newline=${input_newline%x}
+    case "$input_value" in
+        *"$input_newline"*) echo "输入不能包含换行。" >&2; exit 1 ;;
+    esac
+    if printf '%s' "$input_value" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+        echo "输入不能包含控制字符，请重新输入。" >&2
+        exit 1
+    fi
+    case "$input_kind" in
+        domain|optional-domain)
+            printf '%s\n' "$input_value" | LC_ALL=C awk '
+                length($0)>253 || $0 !~ /\./ || $0 ~ /^[0-9.]+$/ {exit 1}
+                {n=split($0,a,"."); for(i=1;i<=n;i++) if(length(a[i])<1 || length(a[i])>63 || a[i] !~ /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$/) exit 1}' && exit 0
+            echo "域名无效：请填写完整域名，不带协议、端口、路径或通配符。" >&2 ;;
+        port|socks-port)
+            [ "$input_kind" != socks-port ] || [ "$input_value" != off ] || exit 0
+            if printf '%s\n' "$input_value" | grep -Eq '^[1-9][0-9]{0,4}$' && [ "$input_value" -le 65535 ]; then exit 0; fi
+            echo "端口须为 1–65535，不带前导零。" >&2 ;;
+        ipv4)
+            printf '%s\n' "$input_value" | awk -F. 'NF!=4 {exit 1} {for(i=1;i<=4;i++) if($i !~ /^[0-9]+$/ || length($i)>3 || ($i ~ /^0/ && length($i)>1) || $i>255) exit 1; if($1==0 || $1==127 || $1>=224) exit 1}' && exit 0
+            echo "请填写有效的公网 IPv4 地址。" >&2 ;;
+        uuid)
+            [ "$input_value" != new ] || exit 0
+            printf '%s\n' "$input_value" | grep -Eqi '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' && exit 0
+            echo "UUID 格式无效；可输入 new 自动生成。" >&2 ;;
+        shortid)
+            printf '%s\n' "$input_value" | grep -Eqi '^([0-9a-f]{2}){1,8}$' && exit 0
+            echo "ShortId 须为 2–16 位、偶数长度十六进制。" >&2 ;;
+        loglevel)
+            case "$input_value" in debug|info|warning|error|none) exit 0 ;; esac
+            echo "请选择 debug、info、warning、error 或 none。" >&2 ;;
+        username) validate_socks_username "$input_value" && exit 0 ;;
+        boolean)
+            case "$input_value" in y|Y|n|N|yes|YES|no|NO|1|0|true|false|on|off) exit 0 ;; esac
+            echo "请输入 y 或 n。" >&2 ;;
+        choice:*)
+            input_choices=${input_kind#choice:}
+            case "$input_choices" in *"|$input_value|"*) exit 0 ;; esac
+            echo "无效选项，请重新输入。" >&2 ;;
+        file)
+            [ -f "$input_value" ] && [ -r "$input_value" ] && exit 0
+            echo "文件不存在或不可读，请重新输入路径。" >&2 ;;
+        output)
+            [ ! -e "$input_value" ] && [ ! -L "$input_value" ] && exit 0
+            echo "文件已存在，请换一个导出路径。" >&2 ;;
+        token|tunnel-token|optional-tunnel-token)
+            case "$input_value" in *[!A-Za-z0-9_+/=-]*) echo "Token 含空白或非法字符，请只粘贴 Token。" >&2; exit 1 ;; esac
+            [ "$input_kind" = token ] || [ "${#input_value}" -ge 40 ] || { echo "隧道 Token 格式无效。" >&2; exit 1; }
+            [ "${#input_value}" -le 8192 ] && exit 0
+            echo "Token 过长。" >&2 ;;
+        bundle-password)
+            [ "${#input_value}" -ge 8 ] && exit 0
+            echo "备份密码至少需要 8 个字符。" >&2 ;;
+        required|optional|password) exit 0 ;;
+        *) echo "未知输入类型。" >&2 ;;
+    esac
+    exit 1
+)
+
+input_prompt() (
+    input_fd=$1; input_label=$2; input_default=$3
+    input_type=${4:-required}; input_hidden=${5:-0}
+    if [ -n "$input_default" ]; then
+        input_label="$input_label [$input_default]"
+    fi
+    while :; do
+        input_reply=$(input_read_line "$input_fd" "$input_label: " "$input_hidden") || exit $?
+        [ -n "$input_reply" ] || input_reply=$input_default
+        if input_validate "$input_type" "$input_reply"; then
+            printf '%s' "$input_reply"
+            exit 0
+        fi
+        # Invalid automation input fails once; never consume the next menu action.
+        [ -t "$input_fd" ] || exit 1
+    done
+)
+
+input_tty_prompt() (
+    if ( : </dev/tty ) 2>/dev/null; then
+        exec 8<>/dev/tty
+        input_prompt 8 "$@"
+    else
+        echo "无交互终端，请通过环境变量提供所需参数。" >&2
+        exit 1
+    fi
+)
+
 # BEGIN subscription HTTPS wizard
 subscription_prompt() {
-    # Read the terminal rather than stdin, including curl | sh installations.
-    sub_reply=""
     if [ -t 3 ] 2>/dev/null; then
-        printf '%s [%s]: ' "$1" "${2:-}" >&3
-        IFS= read -r sub_reply <&3 || return 1
+        input_prompt 3 "$1" "${2:-}" "${3:-required}"
     else
         return 1
     fi
-    printf '%s' "${sub_reply:-${2:-}}"
 }
 
 subscription_validate_options() {
@@ -1242,22 +1519,9 @@ subscription_setup_cloudflare() (
     echo "权限：区域/DNS/编辑 + 区域/区域/读取；资源仅包含此域名所属区域。"
     echo "Token 只在本机输入；acme.sh 会保存它供自动续期使用。"
     if [ -z "${CF_Token:-}" ]; then
-        CF_Token=$(python3 - <<'PY'
-import getpass
-import sys
-try:
-    with open('/dev/tty', 'w') as tty:
-        if not tty.isatty():
-            sys.exit('无终端：请通过 CF_Token 环境变量提供 Cloudflare API Token。')
-        token = getpass.getpass('Cloudflare API Token（隐藏输入）: ', stream=tty)
-except OSError:
-    sys.exit('无终端：请通过 CF_Token 环境变量提供 Cloudflare API Token。')
-if not token or any(c.isspace() for c in token):
-    sys.exit('API Token 不能为空或含空白。')
-print(token, end='')
-PY
-        ) || exit 1
+        CF_Token=$(input_tty_prompt 'Cloudflare API Token（隐藏输入）' '' token 1) || exit 1
     fi
+    input_validate token "$CF_Token" || exit 1
     export CF_Token
     subscription_install_acme || exit 1
     subscription_write_reload_hook || exit 1
@@ -1282,10 +1546,21 @@ PY
     echo "✅ 已配置每日续期检查，证书更新后自动重启订阅服务。"
 )
 
-subscription_certificate_bundle() {
+subscription_certificate_bundle() (
     # PKCS#12 encrypts the certificate and private key. Passwords never enter argv.
+    set +x
+    if [ "${CERT_BUNDLE_PASSWORD+x}" != x ]; then
+        while :; do
+            CERT_BUNDLE_PASSWORD=$(input_tty_prompt '证书备份密码（隐藏输入）' '' bundle-password 1) || exit 1
+            [ "$1" = export ] || break
+            sub_password_again=$(input_tty_prompt '再次输入备份密码' '' bundle-password 1) || exit 1
+            [ "$CERT_BUNDLE_PASSWORD" != "$sub_password_again" ] || break
+            echo "两次密码不一致，请重新输入。" >&2
+        done
+        unset sub_password_again
+    fi
+    export CERT_BUNDLE_PASSWORD
     python3 - "$@" <<'PY'
-import getpass
 import os
 from pathlib import Path
 import re
@@ -1311,12 +1586,7 @@ def write_private(path, data):
 def password(action):
     value = os.environ.get('CERT_BUNDLE_PASSWORD')
     if value is None:
-        with open('/dev/tty', 'w') as tty:
-            if not tty.isatty():
-                raise ValueError('无终端：请通过 CERT_BUNDLE_PASSWORD 环境变量提供备份密码。')
-            value = getpass.getpass('证书备份密码（隐藏输入）: ', stream=tty)
-            if action == 'export' and value != getpass.getpass('再次输入备份密码: ', stream=tty):
-                raise ValueError('两次密码不一致。')
+        raise ValueError('请通过 CERT_BUNDLE_PASSWORD 提供备份密码。')
     if len(value) < 8 or '\n' in value or '\r' in value or '\0' in value:
         raise ValueError('备份密码至少 8 个字符，不能含换行或 NUL。')
     return (value+'\n').encode('utf-8')
@@ -1391,7 +1661,7 @@ try:
 except (OSError, ValueError, ssl.SSLError) as error:
     sys.exit('证书'+('导出' if sys.argv[1:2] == ['export'] else '导入')+'失败: '+str(error))
 PY
-}
+)
 
 subscription_export_certificate() (
     set +x
@@ -1457,7 +1727,7 @@ configure_subscription_https() {
             CLASH_SUB_HTTPS=cloudflare
         elif [ -t 3 ] 2>/dev/null; then
             echo "订阅访问方式：1) Cloudflare 自动申请 HTTPS（推荐） 2) 已有公开证书 3) HTTP 4) 导入加密证书备份"
-            sub_choice=$(subscription_prompt "请选择" 1) || error_exit "订阅向导已中断"
+            sub_choice=$(subscription_prompt "请选择" 1 'choice:|1|2|3|4|') || error_exit "订阅向导已中断"
             case "$sub_choice" in
                 1) CLASH_SUB_HTTPS=cloudflare ;;
                 2) CLASH_SUB_HTTPS=existing ;;
@@ -1472,7 +1742,7 @@ configure_subscription_https() {
     fi
     if [ "$CLASH_SUB_HTTPS" = import ]; then
         if [ -z "$CLASH_SUB_CERT_BUNDLE" ]; then
-            CLASH_SUB_CERT_BUNDLE=$(subscription_prompt "证书备份包路径（.p12）" "") || error_exit "请设置 CLASH_SUB_CERT_BUNDLE"
+            CLASH_SUB_CERT_BUNDLE=$(subscription_prompt "证书备份包路径（.p12）" "" file) || error_exit "请设置 CLASH_SUB_CERT_BUNDLE"
         fi
         subscription_import_certificate
     fi
@@ -1482,10 +1752,11 @@ configure_subscription_https() {
             ;;
         cloudflare|existing|import)
             if [ -z "$CLASH_SUB_HOST" ]; then
-                CLASH_SUB_HOST=$(subscription_prompt "完整订阅域名，例如 zor.zor.de5.net" "") || error_exit "请设置 CLASH_SUB_HOST"
+                CLASH_SUB_HOST=$(subscription_prompt "完整订阅域名，例如 sub.example.com" "" domain) || error_exit "请设置 CLASH_SUB_HOST"
             fi
+            input_validate domain "$CLASH_SUB_HOST" || error_exit "HTTPS 必须提供有效域名"
             if [ "$sub_https_reuse" -eq 0 ] && [ -t 3 ] 2>/dev/null; then
-                CLASH_SUB_PUBLIC_PORT=$(subscription_prompt "公网订阅端口（NAT 外部端口）" "$CLASH_SUB_PUBLIC_PORT") || error_exit "订阅向导已中断"
+                CLASH_SUB_PUBLIC_PORT=$(subscription_prompt "公网订阅端口（NAT 外部端口）" "$CLASH_SUB_PUBLIC_PORT" port) || error_exit "订阅向导已中断"
             fi
             subscription_validate_options || error_exit "请修正订阅域名或端口后重试"
             echo "请在 Cloudflare DNS 添加 A 记录：$CLASH_SUB_HOST → ${CLEAR_IP:-NAT宿主机公网IP}，选择仅 DNS（灰云）。"
@@ -1506,10 +1777,10 @@ configure_subscription_https() {
                 subscription_setup_cloudflare || error_exit "HTTPS 配置未完成，原订阅文件尚未改写。检查 Token 权限/网络后运行 sh xray.sh，选择 3 重试；不要反复重装 Xray。"
             else
                 if [ -z "$CLASH_SUB_TLS_CERT" ]; then
-                    CLASH_SUB_TLS_CERT=$(subscription_prompt "完整证书链路径" /etc/xray/tls/fullchain.pem) || error_exit "请设置 CLASH_SUB_TLS_CERT"
+                    CLASH_SUB_TLS_CERT=$(subscription_prompt "完整证书链路径" /etc/xray/tls/fullchain.pem file) || error_exit "请设置 CLASH_SUB_TLS_CERT"
                 fi
                 if [ -z "$CLASH_SUB_TLS_KEY" ]; then
-                    CLASH_SUB_TLS_KEY=$(subscription_prompt "私钥路径" /etc/xray/tls/key.pem) || error_exit "请设置 CLASH_SUB_TLS_KEY"
+                    CLASH_SUB_TLS_KEY=$(subscription_prompt "私钥路径" /etc/xray/tls/key.pem file) || error_exit "请设置 CLASH_SUB_TLS_KEY"
                 fi
                 subscription_validate_tls || error_exit "证书无效：请检查证书链、公私钥、域名和有效期；灰云直连不能使用 Origin CA"
                 if [ "$CLASH_SUB_HTTPS" != import ]; then
@@ -1567,21 +1838,12 @@ is_truthy() {
 }
 
 prompt_input() {
-    prompt_msg="$1"
-    default_val="${2-}"
-    ans=""
     if ( : </dev/tty ) 2>/dev/null; then
-        if [ -n "$default_val" ]; then
-            printf "%s [%s]: " "$prompt_msg" "$default_val" > /dev/tty
-        else
-            printf "%s: " "$prompt_msg" > /dev/tty
-        fi
-        IFS= read -r ans < /dev/tty || true
+        input_tty_prompt "$1" "${2:-}" "${3:-required}" "${4:-0}"
+    else
+        input_validate "${3:-required}" "${2:-}" || return 1
+        printf '%s' "${2:-}"
     fi
-    if [ -z "$ans" ]; then
-        ans="$default_val"
-    fi
-    printf %s "$ans"
 }
 
 validate_port() {
@@ -1634,10 +1896,10 @@ prompt_socks_credentials() {
         tries=$((tries + 1))
         if [ "$interactive" -eq 1 ]; then
             if [ -z "$SOCKS_USER" ] || [ "$tries" -gt 1 ]; then
-                SOCKS_USER=$(prompt_input "SOCKS5 用户名（1-64，字母数字._@+-）" "${SOCKS_USER}")
+                SOCKS_USER=$(prompt_input "SOCKS5 用户名（1-64，字母数字._@+-）" "${SOCKS_USER}" username)
             fi
             if [ -z "$SOCKS_PASS" ] || [ "$tries" -gt 1 ]; then
-                SOCKS_PASS=$(prompt_input "SOCKS5 密码（任意非空，不做强度校验）" "")
+                SOCKS_PASS=$(prompt_input "SOCKS5 密码（隐藏输入，任意非空）" "" password 1)
             fi
         fi
 
@@ -1708,7 +1970,7 @@ configure_socks_optional() {
         choice="n"
         echo "非交互安装且未设置 ENABLE_SOCKS，跳过 SOCKS5"
     else
-        choice=$(prompt_input "是否启用 SOCKS5 入站？(y/N)" "N")
+        choice=$(prompt_input "是否启用 SOCKS5 入站？(y/N)" "N" boolean)
     fi
 
     if ! is_truthy "$choice"; then
@@ -1723,10 +1985,10 @@ configure_socks_optional() {
 
     # 端口：交互可改；非交互用环境变量/默认
     if ( : </dev/tty ) 2>/dev/null && ! is_truthy "$_socks_enable_in"; then
-        SOCKS_PORT=$(prompt_input "SOCKS5 端口" "${SOCKS_PORT:-10808}")
+        SOCKS_PORT=$(prompt_input "SOCKS5 端口" "${SOCKS_PORT:-10808}" port)
     elif ( : </dev/tty ) 2>/dev/null && [ "$_socks_port_in" = "10808" ]; then
         # 环境只开了开关、没改端口时，仍允许确认/修改
-        SOCKS_PORT=$(prompt_input "SOCKS5 端口" "10808")
+        SOCKS_PORT=$(prompt_input "SOCKS5 端口" "10808" port)
     fi
     SOCKS_PORT="${SOCKS_PORT:-10808}"
     if ! validate_port "$SOCKS_PORT"; then
@@ -3740,10 +4002,10 @@ p = Path(sys.argv[1])
 p.write_text(''.join(line+'\n' for line in p.read_text().splitlines() if line.partition('=')[0] not in os.environ))
 PY
         . "$tunnel_tmp/saved.env"
-        TUNNEL_NODE_HOST=$(manager_read_default '节点完整子域名' "${TUNNEL_NODE_HOST:-}")
-        TUNNEL_SUB_HOST=$(manager_read_default '订阅完整子域名' "${TUNNEL_SUB_HOST:-}")
-        TUNNEL_WS_PORT=$(manager_read_default 'WebSocket 本机端口' "${TUNNEL_WS_PORT:-18081}")
-        TUNNEL_SUB_PORT=$(manager_read_default '隧道订阅本机端口' "${TUNNEL_SUB_PORT:-18082}")
+        TUNNEL_NODE_HOST=$(manager_read_default '节点完整子域名' "${TUNNEL_NODE_HOST:-}" domain)
+        TUNNEL_SUB_HOST=$(manager_read_default '订阅完整子域名' "${TUNNEL_SUB_HOST:-}" domain)
+        TUNNEL_WS_PORT=$(manager_read_default 'WebSocket 本机端口' "${TUNNEL_WS_PORT:-18081}" port)
+        TUNNEL_SUB_PORT=$(manager_read_default '隧道订阅本机端口' "${TUNNEL_SUB_PORT:-18082}" port)
         TUNNEL_METRICS_PORT=${TUNNEL_METRICS_PORT:-20241}
         export TUNNEL_NODE_HOST TUNNEL_SUB_HOST TUNNEL_WS_PORT TUNNEL_SUB_PORT TUNNEL_METRICS_PORT
         TUNNEL_WS_PATH=${TUNNEL_WS_PATH:-}
@@ -3757,7 +4019,11 @@ PY
         TUNNEL_TOKEN=${XRAY_TUNNEL_TOKEN:-}
         unset XRAY_TUNNEL_TOKEN
         if [ -z "$TUNNEL_TOKEN" ]; then
-            TUNNEL_TOKEN=$(manager_read_secret '粘贴隧道 Token（隐藏输入，回车保留已有 Token）: ')
+            if [ -s "$XRAY_DIR/tunnel-token" ]; then
+                TUNNEL_TOKEN=$(manager_read_secret '粘贴隧道 Token（回车保留已有 Token）' optional-tunnel-token)
+            else
+                TUNNEL_TOKEN=$(manager_read_secret '粘贴隧道 Token（必填）' tunnel-token)
+            fi
         fi
         if [ -n "$TUNNEL_TOKEN" ]; then
             printf '%s' "$TUNNEL_TOKEN" > "$tunnel_tmp/tunnel-token"
@@ -3834,9 +4100,7 @@ tunnel_menu() {
 
 # 菜单和操作分发。各操作在子 shell 执行，失败后仍可返回菜单。
 manager_read() {
-    printf '%s' "$1" >&2
-    IFS= read -r manager_reply <&9 || return 1
-    printf '%s' "$manager_reply"
+    input_read_line 9 "$1"
 }
 
 manager_platform() (
@@ -3881,10 +4145,10 @@ manager_install() {
         esac
     fi
     if [ -t 9 ]; then
-        PORT=$(manager_read_default 'Reality 容器监听端口' "$PORT") || return 1
-        NODE_PUBLIC_PORT=$(manager_read_default 'Reality NAT 公网端口' "${NODE_PUBLIC_PORT:-$PORT}") || return 1
-        CLASH_SUB_PORT=$(manager_read_default '订阅容器监听端口' "$CLASH_SUB_PORT") || return 1
-        CLASH_SUB_PUBLIC_PORT=$(manager_read_default '订阅 NAT 公网端口' "${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT}") || return 1
+        PORT=$(manager_read_default 'Reality 容器监听端口' "$PORT" port) || return 1
+        NODE_PUBLIC_PORT=$(manager_read_default 'Reality NAT 公网端口' "${NODE_PUBLIC_PORT:-$PORT}" port) || return 1
+        CLASH_SUB_PORT=$(manager_read_default '订阅容器监听端口' "$CLASH_SUB_PORT" port) || return 1
+        CLASH_SUB_PUBLIC_PORT=$(manager_read_default '订阅 NAT 公网端口' "${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT}" port) || return 1
     fi
     NODE_PUBLIC_PORT="${NODE_PUBLIC_PORT:-$PORT}"
     CLASH_SUB_PUBLIC_PORT="${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT}"
@@ -4087,23 +4351,12 @@ PY
 }
 
 manager_read_default() {
-    manager_value=$(manager_read "$1 [$2]: ") || return 1
-    printf '%s' "${manager_value:-$2}"
+    input_prompt 9 "$1" "$2" "${3:-required}"
 }
 
-manager_read_secret() (
-    if [ -t 9 ]; then
-        manager_stty=$(stty -g <&9) || exit 1
-        trap 'stty "$manager_stty" <&9' EXIT
-        trap 'exit 130' INT
-        trap 'exit 143' TERM
-        stty -echo <&9 || exit 1
-    fi
-    manager_read "$1"
-    manager_secret_status=$?
-    printf '\n' >&2
-    exit "$manager_secret_status"
-)
+manager_read_secret() {
+    input_prompt 9 "$1" '' "${2:-password}" 1
+}
 
 manager_restart_xray() {
     if [ "$XRAY_PLATFORM" = alpine ]; then
@@ -4182,23 +4435,23 @@ manager_edit_config() (
     EDIT_SECRET=''
     case "$EDIT_KIND" in
         1)
-            EDIT_VALUE=$(manager_read_default 'Reality 容器监听端口' "$PORT") || exit 1
-            EDIT_EXTRA=$(manager_read_default 'Reality NAT 公网端口（客户端连接端口）' "$NODE_PUBLIC_PORT") || exit 1 ;;
+            EDIT_VALUE=$(manager_read_default 'Reality 容器监听端口' "$PORT" port) || exit 1
+            EDIT_EXTRA=$(manager_read_default 'Reality NAT 公网端口（客户端连接端口）' "$NODE_PUBLIC_PORT" port) || exit 1 ;;
         2)
-            EDIT_VALUE=$(manager_read_default '订阅容器监听端口' "$CLASH_SUB_PORT") || exit 1
-            EDIT_EXTRA=$(manager_read_default '订阅 NAT 公网端口' "${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT}") || exit 1 ;;
-        3) EDIT_VALUE=$(manager_read_default '客户端连接的公网 IPv4' "$CLEAR_IP") || exit 1 ;;
-        4) EDIT_VALUE=$(manager_read_default 'Reality SNI（dest 将同步设为该域名:443）' "$SNI") || exit 1 ;;
-        5) EDIT_VALUE=$(manager_read_default '新 UUID（输入 new 自动生成）' "$USER_UUID") || exit 1
+            EDIT_VALUE=$(manager_read_default '订阅容器监听端口' "$CLASH_SUB_PORT" port) || exit 1
+            EDIT_EXTRA=$(manager_read_default '订阅 NAT 公网端口' "${CLASH_SUB_PUBLIC_PORT:-$CLASH_SUB_PORT}" port) || exit 1 ;;
+        3) EDIT_VALUE=$(manager_read_default '客户端连接的公网 IPv4' "$CLEAR_IP" ipv4) || exit 1 ;;
+        4) EDIT_VALUE=$(manager_read_default 'Reality SNI（dest 将同步设为该域名:443）' "$SNI" domain) || exit 1 ;;
+        5) EDIT_VALUE=$(manager_read_default '新 UUID（输入 new 自动生成）' "$USER_UUID" uuid) || exit 1
            [ "$EDIT_VALUE" != new ] || EDIT_VALUE=$(python3 -c 'import uuid; print(uuid.uuid4())') ;;
-        6) EDIT_VALUE=$(manager_read_default 'ShortId（2–16 位偶数长度十六进制）' "$SHORT_ID") || exit 1 ;;
+        6) EDIT_VALUE=$(manager_read_default 'ShortId（2–16 位偶数长度十六进制）' "$SHORT_ID" shortid) || exit 1 ;;
         7)
-            EDIT_VALUE=$(manager_read 'SOCKS5：输入 off 关闭，或输入监听端口以启用 / 修改: ') || exit 1
+            EDIT_VALUE=$(manager_read_default 'SOCKS5：输入 off 关闭，或输入监听端口以启用 / 修改' '' socks-port) || exit 1
             if [ "$EDIT_VALUE" != off ]; then
-                EDIT_EXTRA=$(manager_read 'SOCKS5 用户名: ') || exit 1
-                EDIT_SECRET=$(manager_read_secret 'SOCKS5 密码（隐藏输入）: ') || exit 1
+                EDIT_EXTRA=$(manager_read_default 'SOCKS5 用户名' '' username) || exit 1
+                EDIT_SECRET=$(manager_read_secret 'SOCKS5 密码（隐藏输入）') || exit 1
             fi ;;
-        8) EDIT_VALUE=$(manager_read_default '日志级别 debug/info/warning/error/none' "$XRAY_LOG_LEVEL") || exit 1 ;;
+        8) EDIT_VALUE=$(manager_read_default '日志级别 debug/info/warning/error/none' "$XRAY_LOG_LEVEL" loglevel) || exit 1 ;;
         9) echo "将生成新订阅口令。旧订阅 URL 会失效，请在客户端替换地址。" ;;
         *) error_exit "未知配置项" ;;
     esac
@@ -4279,14 +4532,18 @@ manager_edit_https() (
     load_node_settings > "$config_tmp/current.env"
     . "$config_tmp/current.env"
     echo "订阅访问方式：1) Cloudflare 自动 HTTPS / 续期 2) 已有公开证书 3) 保留当前方式，仅改域名"
-    config_https_mode=$(manager_read '请选择 [1–3]: ') || exit 1
-    CLASH_SUB_HOST=$(manager_read_default '完整订阅域名' "$CLASH_SUB_HOST") || exit 1
+    config_https_mode=$(manager_read_default '请选择 [1–3]' '' 'choice:|1|2|3|') || exit 1
+    config_domain_type=domain
+    if [ "$config_https_mode" = 3 ] && [ -z "$CLASH_SUB_TLS_CERT$CLASH_SUB_TLS_KEY" ]; then
+        config_domain_type=optional-domain
+    fi
+    CLASH_SUB_HOST=$(manager_read_default '完整订阅域名' "$CLASH_SUB_HOST" "$config_domain_type") || exit 1
     case "$config_https_mode" in
         1) CLASH_SUB_HTTPS=cloudflare ;;
         2)
             CLASH_SUB_HTTPS=existing
-            CLASH_SUB_TLS_CERT=$(manager_read_default 'PEM 完整证书链路径' "${CLASH_SUB_TLS_CERT:-/etc/xray/tls/fullchain.pem}") || exit 1
-            CLASH_SUB_TLS_KEY=$(manager_read_default 'PEM 私钥路径' "${CLASH_SUB_TLS_KEY:-/etc/xray/tls/key.pem}") || exit 1 ;;
+            CLASH_SUB_TLS_CERT=$(manager_read_default 'PEM 完整证书链路径' "${CLASH_SUB_TLS_CERT:-/etc/xray/tls/fullchain.pem}" file) || exit 1
+            CLASH_SUB_TLS_KEY=$(manager_read_default 'PEM 私钥路径' "${CLASH_SUB_TLS_KEY:-/etc/xray/tls/key.pem}" file) || exit 1 ;;
         3)
             if [ -n "$CLASH_SUB_TLS_CERT$CLASH_SUB_TLS_KEY" ]; then
                 CLASH_SUB_HTTPS=existing
@@ -4364,8 +4621,7 @@ manager_dispatch() (
             case "$1" in
                 3) CLASH_SUB_HTTPS=cloudflare ;;
                 6)
-                    CLASH_SUB_CERT_BUNDLE=$(manager_read '要导入的证书备份路径 [.p12]: ') || exit 1
-                    [ -n "$CLASH_SUB_CERT_BUNDLE" ] || error_exit "备份路径不能为空"
+                    CLASH_SUB_CERT_BUNDLE=$(manager_read_default '要导入的证书备份路径 [.p12]' '' file) || exit 1
                     CLASH_SUB_HTTPS=import ;;
             esac
             update_subscription ;;
@@ -4377,8 +4633,8 @@ manager_dispatch() (
                 run_diagnostic
             fi ;;
         5)
-            manager_bundle=$(manager_read '导出路径 [/root/sub-cert.p12]: ') || exit 1
-            subscription_export_certificate "${manager_bundle:-/root/sub-cert.p12}" ;;
+            manager_bundle=$(manager_read_default '导出路径' /root/sub-cert.p12 output) || exit 1
+            subscription_export_certificate "$manager_bundle" ;;
         7) manager_show_client ;;
         8) manager_restart ;;
         9) manager_logs ;;
