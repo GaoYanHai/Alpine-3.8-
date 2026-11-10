@@ -1,6 +1,6 @@
-# Xray Reality 管理脚本
+# Xray REALITY / Cloudflare Tunnel 管理脚本
 
-面向 Alpine LXC / Debian LXD、NAT VPS 的 VLESS + TCP + REALITY + Vision 管理工具。所有操作集中在 **`xray.sh`**，自动识别系统，通过编号菜单管理安装、订阅、HTTPS、诊断和证书迁移。
+面向 Alpine LXC / Debian LXD、NAT VPS 的 Xray 管理工具，支持 VLESS + TCP + REALITY + Vision，以及固定 Cloudflare Tunnel 上的 VLESS + WebSocket + TLS。所有操作集中在 **`xray.sh`**，自动识别系统，通过编号菜单管理安装、订阅、HTTPS、隧道、诊断和证书迁移。
 
 支持 x86_64 / amd64；Alpine 使用 OpenRC / apk，Debian 使用 systemd / apt。安装与管理操作需要 root。
 
@@ -33,6 +33,7 @@ sh xray.sh
   8. 重启 Xray 和订阅服务
   9. 查看最近日志
  10. 修改配置（端口 / NAT / 节点 / SOCKS5 / HTTPS）
+ 11. 固定 Cloudflare Tunnel（域名节点 / HTTPS 订阅）
   0. 退出
 ```
 
@@ -46,6 +47,7 @@ sh xray.sh
 | 已有节点复用其他机器的证书 | **6** |
 | 找回分享链接或订阅地址 | **7** |
 | 调整端口、节点参数、SOCKS5 或订阅设置 | **10** |
+| VPS IP 无法直连，使用固定域名隧道 | **11** |
 
 **已有用户也只需下载 `xray.sh`。** 脚本继续使用 `/etc/xray/` 下的现有配置。更新订阅选 **2**，开启 HTTPS 选 **3**。选择 **1** 重新安装会生成新的 UUID、密钥和订阅口令，检测到已有配置时会要求确认。
 
@@ -106,6 +108,18 @@ lxc config device add <实例名> subproxy proxy listen=tcp:0.0.0.0:58472 connec
 「订阅域名 / HTTPS / 证书」可接入 Cloudflare 自动签发、使用自己的公开证书，或保留访问方式只改域名。HTTPS 域名必须被证书覆盖；更换域名后请同步更新 DNS。导入 `.p12` 仍使用主菜单 **6**。
 
 ## 客户端与订阅
+
+### 固定 Cloudflare Tunnel
+
+VPS 公网 IP 无法从客户端直接访问时，可以通过主菜单 **11** 接入固定 Cloudflare Tunnel。新增独立的 **VLESS + WebSocket + TLS** 节点，客户端连接节点子域名的 `443`，cloudflared 从 VPS 主动出站连接 Cloudflare；原 REALITY 节点继续保留。
+
+准备托管在 Cloudflare 的域名，在控制台创建 cloudflared 命名隧道，添加节点和订阅两个子域名路由，分别指向 `http://127.0.0.1:18081`、`http://127.0.0.1:18082`。运行 `sh xray.sh 11`，选择 **1**，填写域名并隐藏输入 Token；脚本安装程序、设置开机启动，验证本机与公网路由，失败时回滚。
+
+固定隧道的 Clash、原生 VLESS 和完整 Xray 客户端订阅均使用 HTTPS，无需在 VPS 申请证书或映射隧道入站端口。菜单 **7** 或 **11 → 2** 查看链接，**11 → 3** 检查连接，**11 → 4** 停用。VPS 需能出站连接 Cloudflare 的 TCP `7844`，客户端需能访问 Cloudflare 边缘网络。
+
+域名路由、客户端参数、回滚及完整运维步骤见 **[固定隧道实施方案](docs/cloudflare-tunnel.md)**。
+
+### 原 REALITY 节点
 
 安装完成后会打印分享链接和两种订阅地址，也可以通过菜单 **7** 再次查看：
 
@@ -202,6 +216,10 @@ SOCKS5 默认关闭，可在安装时开启。用户名为 1–64 个字母、�
 2026-10-30 在 Debian 12 amd64、约 488 MB 内存的 LXD NAT VPS 上完成安装与 30 项功能检查，包括内外端口修改和恢复、订阅更新、SNI / UUID / ShortId 修改、SOCKS5 认证出站、取消与非法参数校验、端口占用、服务自检失败回滚、订阅口令重置，以及 REALITY 客户端实际握手和代理出站。诊断复测为 17 项通过、0 个严重问题。
 
 实测修复了无交互终端下 `/dev/tty` 误判、端口恢复时 TIME_WAIT 误报占用、节点说明显示临时路径，以及多行 JSON 导致诊断误读 SNI / ShortId 的问题。REALITY 握手与订阅 HTTP 响应在服务器本机验证，公网两个端口另经 WebSSH 出口确认 TCP 可连接；尚未完成外部客户端的完整连接测试。HTTPS 签发与证书迁移本轮未在真实域名上验证。
+
+2026-11-05 通过 WebSSH 继续同一台 Debian 12 LXD VPS 的安装与功能验证，累计通过 **45 项检查**，包括 REALITY 实际握手和代理出站、端口 / NAT / 节点参数修改、SOCKS5 认证、订阅口令重置和失败回滚。新增使用临时测试 CA 验证 HTTPS 订阅、加密证书导出 / 导入、错误密码拒绝、域名不匹配回滚及禁止静默降级，测试后恢复 HTTP 并移除测试证书和信任根。
+
+本次修复 Debian 安装生成的节点配置权限（改为仅 root 可读写），以及重启命令返回时订阅进程尚未开始监听的时序问题：重启现在检查 Xray 监听和订阅响应，订阅自检会短暂重试连接。真实域名的 Cloudflare DNS-01 签发、自动续期和外部客户端完整连接仍未验证。详细记录见 [VPS 验证记录](docs/vps-validation-2026-11-05.md)。
 
 ## 高级参数
 

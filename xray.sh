@@ -460,12 +460,26 @@ def load_env(path="/etc/xray/clash-sub.env"):
     return env
 
 cfg = load_env()
+TUNNEL = os.environ.get("XRAY_SUB_TUNNEL") == "1"
+TUNNEL_CONFIG = "/etc/xray/tunnel.json"
+if TUNNEL:
+    import base64
+    import json
+    import re
+    from urllib.parse import urlencode
+    with open(TUNNEL_CONFIG) as fh:
+        tunnel = json.load(fh)
+    if tunnel.get("enabled") is not True:
+        sys.exit("tunnel disabled")
 PORT = int(cfg.get("CLASH_SUB_PORT", "58472"))
 TOKEN = cfg.get("CLASH_SUB_TOKEN", "")
 FILE = cfg.get("CLASH_SUB_FILE", "/etc/xray/clash-meta.yaml")
 V2RAYN_FILE = cfg.get("V2RAYN_SUB_FILE", "/etc/xray/v2rayn.txt")
 TLS_CERT = cfg.get("CLASH_SUB_TLS_CERT", "")
 TLS_KEY = cfg.get("CLASH_SUB_TLS_KEY", "")
+if TUNNEL:
+    PORT = int(tunnel["sub_port"])
+    TLS_CERT = TLS_KEY = ""
 if not TOKEN:
     sys.exit("empty CLASH_SUB_TOKEN")
 REQ_PATH = "/" + TOKEN + "/clash.yaml"
@@ -473,6 +487,35 @@ ROUTES = {
     REQ_PATH: (FILE, "text/yaml; charset=utf-8"),
     "/" + TOKEN + "/vless.txt": (V2RAYN_FILE, "text/plain; charset=utf-8"),
 }
+if TUNNEL:
+    ROUTES["/" + TOKEN + "/xray.json"] = ("/etc/xray/xray-client.json", "application/json")
+
+def tunnel_response(path, data):
+    # Only the tunnel listener transforms responses; the direct listener is unchanged.
+    query = urlencode(dict(encryption="none", security="tls", sni=tunnel["node_host"],
+                           fp="chrome", type="ws", host=tunnel["node_host"], path=tunnel["path"]))
+    link = ("vless://" + tunnel["uuid"] + "@" + tunnel["node_host"] + ":443?" + query + "#Cloudflare-Tunnel")
+    if path.endswith("/vless.txt"):
+        return base64.b64encode((link + "\n").encode()) + b"\n"
+    if path.endswith("/xray.json"):
+        client = json.loads(data)
+        outbound = next(v for v in client["outbounds"] if v.get("protocol") == "vless")
+        outbound["settings"] = {"vnext": [{"address": tunnel["node_host"], "port": 443,
+            "users": [{"id": tunnel["uuid"], "encryption": "none"}]}]}
+        outbound["streamSettings"] = {"network": "ws", "security": "tls",
+            "tlsSettings": {"serverName": tunnel["node_host"], "fingerprint": "chrome"},
+            "wsSettings": {"path": tunnel["path"], "headers": {"Host": tunnel["node_host"]}}}
+        return (json.dumps(client, ensure_ascii=False, indent=2) + "\n").encode()
+    text = data.decode("utf-8")
+    match = re.search(r"(?m)^proxies:\n(  - name: [^\n]+)\n.*?(?=^proxy-groups:)", text, re.S)
+    if not match:
+        raise ValueError("subscription template has no proxy section")
+    proxy = ("proxies:\n" + match[1] + "\n    type: vless\n    server: " + json.dumps(tunnel["node_host"])
+        + "\n    port: 443\n    uuid: " + json.dumps(tunnel["uuid"])
+        + "\n    network: ws\n    tls: true\n    udp: true\n    servername: " + json.dumps(tunnel["node_host"])
+        + "\n    client-fingerprint: chrome\n    ws-opts:\n      path: " + json.dumps(tunnel["path"])
+        + "\n      headers:\n        Host: " + json.dumps(tunnel["node_host"]) + "\n\n")
+    return (text[:match.start()] + proxy + text[match.end():]).encode()
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -494,6 +537,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if TUNNEL:
+            try:
+                data = tunnel_response(path, data)
+            except (ValueError, KeyError, StopIteration):
+                self.send_error(503, "Subscription unavailable")
+                return
         self.send_response(200)
         self.send_header("Content-Type", route[1])
         self.send_header("Content-Length", str(len(data)))
@@ -502,7 +551,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 if __name__ == "__main__":
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server = HTTPServer(("127.0.0.1" if TUNNEL else "0.0.0.0", PORT), Handler)
     if TLS_CERT or TLS_KEY:
         if not TLS_CERT or not TLS_KEY:
             sys.exit("both CLASH_SUB_TLS_CERT and CLASH_SUB_TLS_KEY are required")
@@ -522,6 +571,9 @@ start_clash_sub_service() {
         debian) start_clash_sub_debian ;;
         *) error_exit "不支持的系统" ;;
     esac
+    if tunnel_enabled; then
+        tunnel_start_subscription
+    fi
 }
 
 start_clash_sub_alpine() {
@@ -1476,9 +1528,19 @@ import http.client
 import socket
 import ssl
 import sys
+import time
 host, port, token, cert = sys.argv[1:]
 try:
-    stream = socket.create_connection(('127.0.0.1', int(port)), timeout=8)
+    # systemd Type=simple reports active before Python binds the socket.
+    for attempt in range(20):
+        try:
+            stream = socket.create_connection(('127.0.0.1', int(port)), timeout=1)
+            break
+        except OSError:
+            if attempt == 19:
+                raise
+            time.sleep(0.25)
+    stream.settimeout(8)
     if cert:
         stream = ssl.create_default_context().wrap_socket(stream, server_hostname=host)
     with stream:
@@ -2435,7 +2497,7 @@ if [ "${ENABLE_SOCKS:-0}" = "1" ]; then
     jq '.inbounds[] | select(.protocol=="socks") | {tag,listen,port,protocol,auth:.settings.auth,udp:.settings.udp,user:.settings.accounts[0].user}' "$XRAY_CONFIG" 2>/dev/null || true
 fi
 
-run_cmd chmod 644 "$XRAY_CONFIG"
+run_cmd chmod 600 "$XRAY_CONFIG"
 run_cmd chown root:root "$XRAY_CONFIG"
 
 # 5. 系统网络优化
@@ -3333,6 +3395,443 @@ echo "=========================================="
 
 )
 
+# 固定 Cloudflare Tunnel：控制台管理路由，凭据仅保存在 root 私有文件。
+tunnel_enabled() {
+    [ -f "$XRAY_DIR/tunnel.json" ] || return 1
+    python3 - "$XRAY_DIR/tunnel.json" <<'PY'
+import json, sys
+try:
+    sys.exit(0 if json.load(open(sys.argv[1])).get('enabled') is True else 1)
+except (OSError, ValueError):
+    sys.exit(1)
+PY
+}
+
+tunnel_load() {
+    python3 - "$XRAY_DIR/tunnel.json" <<'PY'
+import json, shlex, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+cfg = json.loads(p.read_text()) if p.exists() else {}
+fields = {'TUNNEL_NODE_HOST': 'node_host', 'TUNNEL_SUB_HOST': 'sub_host',
+          'TUNNEL_WS_PORT': 'ws_port', 'TUNNEL_SUB_PORT': 'sub_port',
+          'TUNNEL_METRICS_PORT': 'metrics_port', 'TUNNEL_WS_PATH': 'path'}
+for name, key in fields.items():
+    if key in cfg:
+        print(name+'='+shlex.quote(str(cfg[key])))
+PY
+}
+
+tunnel_stage() {
+    python3 - "$XRAY_CONFIG" "$XRAY_DIR/tunnel.json" "$XRAY_DIR/clash-sub.env" "$tunnel_tmp" "$1" <<'PY'
+import ipaddress, json, os, re, secrets, socket, sys, uuid
+from pathlib import Path
+try:
+    config_path, meta_path, env_path, destination, action = map(Path, sys.argv[1:])
+    config = json.loads(config_path.read_text())
+    old = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    folder = destination
+    managed = [v for v in config['inbounds'] if v.get('tag') == 'xray-cf-ws']
+    if len(managed) > 1:
+        raise ValueError('存在多个隧道入站，请先检查配置')
+    if managed and (managed[0].get('protocol') != 'vless' or managed[0].get('streamSettings', {}).get('network') != 'ws'):
+        raise ValueError('xray-cf-ws 标签已被其他入站使用')
+    config['inbounds'] = [v for v in config['inbounds'] if v.get('tag') != 'xray-cf-ws']
+    if str(action) == 'disable':
+        result = {**old, 'enabled': False}
+    else:
+        def host(key):
+            value = os.environ[key].lower()
+            if len(value) > 253 or '.' not in value or not all(re.fullmatch(
+                    r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', p) for p in value.split('.')):
+                raise ValueError('请填写完整子域名，不带协议、端口或路径')
+            try:
+                ipaddress.ip_address(value)
+            except ValueError:
+                return value
+            raise ValueError('隧道地址必须是域名')
+        def port(key):
+            value = os.environ[key]
+            if not re.fullmatch(r'[1-9][0-9]{0,4}', value) or not 1 <= int(value) <= 65535:
+                raise ValueError('本机端口须为 1–65535，无前导零')
+            return int(value)
+        result = dict(enabled=True, node_host=host('TUNNEL_NODE_HOST'), sub_host=host('TUNNEL_SUB_HOST'),
+            ws_port=port('TUNNEL_WS_PORT'), sub_port=port('TUNNEL_SUB_PORT'),
+            metrics_port=port('TUNNEL_METRICS_PORT'))
+        if result['node_host'] == result['sub_host']:
+            raise ValueError('节点和订阅须使用不同子域名')
+        path = os.environ.get('TUNNEL_WS_PATH') or old.get('path') or '/'+secrets.token_hex(16)
+        if not re.fullmatch(r'/[A-Za-z0-9/_-]{1,180}', path):
+            raise ValueError('WebSocket 路径须以 / 开头，仅含字母、数字、/、_、-')
+        result['path'] = path
+        result['uuid'] = str(uuid.UUID(old['uuid'])) if old.get('uuid') else str(uuid.uuid4())
+        saved = dict(line.split('=', 1) for line in env_path.read_text().splitlines() if '=' in line)
+        occupied = {int(v['port']) for v in config['inbounds'] if 'port' in v}
+        occupied.add(int(saved['CLASH_SUB_PORT']))
+        ports = [result[k] for k in ('ws_port', 'sub_port', 'metrics_port')]
+        if len(set(ports)) != 3 or occupied.intersection(ports):
+            raise ValueError('隧道的三个本机端口不能相同，或与现有节点、订阅端口冲突')
+        for key in ('ws_port', 'sub_port', 'metrics_port'):
+            number = result[key]
+            if old.get('enabled') is True and old.get(key) == number:
+                continue
+            with socket.socket() as probe:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                probe.bind(('127.0.0.1', number))
+        config['inbounds'].append(dict(tag='xray-cf-ws', listen='127.0.0.1', port=result['ws_port'],
+            protocol='vless', settings={'clients': [{'id': result['uuid']}], 'decryption': 'none'},
+            streamSettings={'network': 'ws', 'security': 'none', 'wsSettings': {'path': path}}))
+    (folder/'config.json').write_text(json.dumps(config, ensure_ascii=False, indent=4)+'\n')
+    (folder/'tunnel.json').write_text(json.dumps(result, ensure_ascii=False, indent=2)+'\n')
+except (OSError, ValueError, KeyError) as error:
+    sys.exit('隧道配置校验失败：'+str(error))
+PY
+}
+
+tunnel_install_binary() (
+    set -eu
+    if [ -x /usr/local/bin/cloudflared ] && /usr/local/bin/cloudflared tunnel run --help 2>/dev/null | grep -q -- --token-file; then
+        return 0
+    fi
+    echo "正在下载官方 cloudflared，并校验发布文件的 SHA-256..."
+    cf_download=$(mktemp -d)
+    trap 'rm -rf -- "$cf_download"' EXIT
+    curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 \
+        https://api.github.com/repos/cloudflare/cloudflared/releases/latest -o "$cf_download/release.json"
+    python3 - "$cf_download" <<'PY'
+import json, re, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+asset = next(v for v in json.loads((p/'release.json').read_text())['assets'] if v['name'] == 'cloudflared-linux-amd64')
+url, digest = asset['browser_download_url'], asset.get('digest', '')
+if not url.startswith('https://github.com/cloudflare/cloudflared/releases/download/') or not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+    sys.exit('官方发布缺少有效下载地址或校验摘要，停止安装')
+(p/'url').write_text(url)
+(p/'digest').write_text(digest[7:])
+PY
+    curl -fL --connect-timeout 10 --max-time 180 --retry 2 "$(cat "$cf_download/url")" -o "$cf_download/cloudflared"
+    python3 - "$cf_download" <<'PY'
+import hashlib, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+if hashlib.sha256((p/'cloudflared').read_bytes()).hexdigest() != (p/'digest').read_text():
+    sys.exit('cloudflared 校验失败')
+PY
+    chmod 755 "$cf_download/cloudflared"
+    "$cf_download/cloudflared" tunnel run --help | grep -q -- --token-file || error_exit "cloudflared 不支持凭据文件"
+    cp "$cf_download/cloudflared" /usr/local/bin/cloudflared
+    chmod 755 /usr/local/bin/cloudflared
+)
+
+tunnel_write_services() {
+    tunnel_settings=$(tunnel_load) || return 1
+    eval "$tunnel_settings"
+    if [ "$XRAY_PLATFORM" = debian ]; then
+        cat > /etc/systemd/system/xray-tunnel-sub.service <<'UNIT'
+[Unit]
+Description=Xray subscription through Cloudflare Tunnel
+After=network.target xray.service
+[Service]
+Type=simple
+Environment=XRAY_SUB_TUNNEL=1
+ExecStart=/usr/bin/python3 /usr/local/bin/xray-clash-sub.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+[Install]
+WantedBy=multi-user.target
+UNIT
+        cat > /etc/systemd/system/xray-cloudflared.service <<UNIT
+[Unit]
+Description=Xray named Cloudflare Tunnel
+After=network-online.target xray.service xray-tunnel-sub.service
+Wants=network-online.target
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --protocol http2 --metrics 127.0.0.1:$TUNNEL_METRICS_PORT run --token-file /etc/xray/tunnel-token
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+[Install]
+WantedBy=multi-user.target
+UNIT
+        chmod 644 /etc/systemd/system/xray-tunnel-sub.service /etc/systemd/system/xray-cloudflared.service
+        systemctl daemon-reload
+    else
+        cat > /etc/init.d/xray-tunnel-sub <<'INIT'
+#!/sbin/openrc-run
+description="Xray subscription through Cloudflare Tunnel"
+command="/usr/bin/python3"
+command_args="/usr/local/bin/xray-clash-sub.py"
+supervisor="supervise-daemon"
+respawn_delay=5
+output_log="/var/log/xray-tunnel-sub.log"
+error_log="/var/log/xray-tunnel-sub.log"
+export XRAY_SUB_TUNNEL=1
+depend() { need net; after local; }
+INIT
+        cat > /etc/init.d/xray-cloudflared <<INIT
+#!/sbin/openrc-run
+description="Xray named Cloudflare Tunnel"
+supervisor="supervise-daemon"
+command="/usr/local/bin/cloudflared"
+command_args="tunnel --no-autoupdate --protocol http2 --metrics 127.0.0.1:$TUNNEL_METRICS_PORT run --token-file /etc/xray/tunnel-token"
+respawn_delay=5
+output_log="/var/log/xray-cloudflared.log"
+error_log="/var/log/xray-cloudflared.log"
+depend() { need net; after local xray-tunnel-sub; }
+INIT
+        chmod 755 /etc/init.d/xray-tunnel-sub /etc/init.d/xray-cloudflared
+    fi
+}
+
+tunnel_start_subscription() {
+    if [ "$XRAY_PLATFORM" = debian ]; then
+        systemctl restart xray-tunnel-sub.service
+    else
+        rc-service xray-tunnel-sub restart
+    fi
+    tunnel_health subscription
+}
+
+tunnel_services() {
+    case "$1" in
+        start)
+            tunnel_write_services
+            if [ "$XRAY_PLATFORM" = debian ]; then
+                systemctl enable xray-tunnel-sub.service xray-cloudflared.service >/dev/null
+                systemctl restart xray-tunnel-sub.service xray-cloudflared.service
+            else
+                rc-update add xray-tunnel-sub default
+                rc-update add xray-cloudflared default
+                rc-service xray-tunnel-sub restart
+                rc-service xray-cloudflared restart
+            fi ;;
+        stop)
+            if [ "$XRAY_PLATFORM" = debian ]; then
+                for tunnel_unit in xray-cloudflared.service xray-tunnel-sub.service; do
+                    [ -f "/etc/systemd/system/$tunnel_unit" ] || continue
+                    systemctl stop "$tunnel_unit" || return 1
+                    systemctl disable "$tunnel_unit" || return 1
+                done
+            else
+                for tunnel_unit in xray-cloudflared xray-tunnel-sub; do
+                    [ -f "/etc/init.d/$tunnel_unit" ] || continue
+                    if rc-service "$tunnel_unit" status >/dev/null 2>&1; then
+                        rc-service "$tunnel_unit" stop || return 1
+                    fi
+                    rc-update del "$tunnel_unit" default 2>/dev/null || true
+                done
+            fi ;;
+    esac
+}
+
+tunnel_health() {
+    python3 - "$XRAY_DIR/tunnel.json" "$XRAY_DIR/clash-sub.env" "${1:-local}" <<'PY'
+import base64, http.client, json, os, socket, sys, time
+cfg = json.load(open(sys.argv[1]))
+saved = dict(line.strip().split('=', 1) for line in open(sys.argv[2]) if '=' in line)
+def request(host, port, path, tls=False, headers=None):
+    connection = (http.client.HTTPSConnection if tls else http.client.HTTPConnection)(host, port, timeout=8)
+    try:
+        connection.request('GET', path, headers=headers or {})
+        response = connection.getresponse()
+        return response.status, b'' if response.status == 101 else response.read()
+    finally:
+        connection.close()
+def upgrade(host, port, tls):
+    status, _ = request(host, port, cfg['path'], tls, {'Host': cfg['node_host'],
+        'Connection': 'Upgrade', 'Upgrade': 'websocket', 'Sec-WebSocket-Version': '13',
+        'Sec-WebSocket-Key': base64.b64encode(os.urandom(16)).decode()})
+    if status != 101:
+        raise ValueError('WebSocket 未返回 101，请检查节点域名路由、路径和 Cloudflare 访问规则')
+try:
+    for attempt in range(30):
+        try:
+            if request('127.0.0.1', cfg['sub_port'], '/'+saved['CLASH_SUB_TOKEN']+'/clash.yaml')[0] != 200:
+                raise ValueError('隧道订阅尚未就绪')
+            if sys.argv[3] != 'subscription':
+                if request('127.0.0.1', cfg['metrics_port'], '/ready')[0] != 200:
+                    raise ValueError('Tunnel 尚未连接 Cloudflare')
+                upgrade('127.0.0.1', cfg['ws_port'], False)
+            break
+        except (OSError, ValueError, http.client.HTTPException):
+            if attempt == 29:
+                raise
+            time.sleep(0.5)
+    print('✅ 隧道订阅本机自检通过' if sys.argv[3] == 'subscription' else '✅ 隧道连接、WebSocket 入站与本机订阅自检通过')
+    if sys.argv[3] == 'public':
+        status, body = request(cfg['sub_host'], 443, '/'+saved['CLASH_SUB_TOKEN']+'/clash.yaml', True)
+        if status != 200 or cfg['node_host'].encode() not in body or b'network: ws' not in body:
+            raise ValueError('公网订阅未返回本隧道配置，请检查订阅域名路由、DNS 和 Access / WAF 规则')
+        upgrade(cfg['node_host'], 443, True)
+        print('✅ 公网 HTTPS 订阅与 WebSocket 升级通过；仍需从客户端验证完整代理连接')
+except (OSError, ValueError, http.client.HTTPException):
+    sys.exit('隧道自检失败：检查 cloudflared 日志、出站 TCP 7844，以及控制台的域名和 HTTP 服务路由。')
+PY
+}
+
+tunnel_show() {
+    tunnel_enabled || { echo "尚未启用固定隧道。"; return 0; }
+    python3 - "$XRAY_DIR/tunnel.json" "$XRAY_DIR/clash-sub.env" <<'PY'
+import json, sys
+from urllib.parse import urlencode
+c = json.load(open(sys.argv[1]))
+e = dict(line.strip().split('=', 1) for line in open(sys.argv[2]) if '=' in line)
+query = urlencode(dict(encryption='none', security='tls', sni=c['node_host'], fp='chrome',
+                       type='ws', host=c['node_host'], path=c['path']))
+print('\n固定 Cloudflare Tunnel（VLESS / WebSocket / TLS）:')
+print('vless://'+c['uuid']+'@'+c['node_host']+':443?'+query+'#Cloudflare-Tunnel')
+for filename in ('clash.yaml', 'vless.txt', 'xray.json'):
+    print('https://'+c['sub_host']+'/'+e['CLASH_SUB_TOKEN']+'/'+filename)
+print('控制台节点路由: '+c['node_host']+' → http://127.0.0.1:'+str(c['ws_port']))
+print('控制台订阅路由: '+c['sub_host']+' → http://127.0.0.1:'+str(c['sub_port']))
+print('客户端端口 443；TLS 开启；传输 ws；不填写 Reality 公钥或 flow。')
+PY
+}
+
+tunnel_finish() {
+    tunnel_exit=$?
+    trap - EXIT INT TERM
+    if [ "$tunnel_committed" = 1 ] && [ "$tunnel_success" = 0 ]; then
+        echo "隧道操作失败，正在恢复原配置和服务..." >&2
+        tunnel_services stop || echo "警告：隧道服务停止失败，请检查日志。" >&2
+        for tunnel_name in config.json tunnel.json tunnel-token; do
+            if [ -f "$tunnel_backup/$tunnel_name" ]; then
+                cp -p "$tunnel_backup/$tunnel_name" "$XRAY_DIR/$tunnel_name"
+            else
+                rm -f -- "$XRAY_DIR/$tunnel_name"
+            fi
+        done
+        manager_restart_xray || echo "警告：原 Xray 服务恢复失败，请检查日志。" >&2
+        if tunnel_enabled; then
+            tunnel_services start || echo "警告：原隧道服务恢复失败，请检查日志。" >&2
+        fi
+        echo "原配置备份：$tunnel_backup" >&2
+    fi
+    [ -z "$tunnel_tmp" ] || rm -rf -- "$tunnel_tmp"
+    rmdir "$XRAY_DIR/.manager-config-lock" 2>/dev/null || true
+    exit "$tunnel_exit"
+}
+
+tunnel_configure() (
+    set -eu
+    set +x
+    umask 077
+    manager_require_platform
+    [ -f "$XRAY_CONFIG" ] && [ -f "$XRAY_DIR/clash-sub.env" ] || error_exit "请先选择主菜单 1 安装节点"
+    [ "$(uname -m)" = x86_64 ] || error_exit "目前固定隧道安装仅支持 x86_64 / amd64"
+    mkdir "$XRAY_DIR/.manager-config-lock" 2>/dev/null || error_exit "另一个配置修改正在进行"
+    tunnel_tmp=''; tunnel_backup=''; tunnel_committed=0; tunnel_success=0
+    trap tunnel_finish EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    tunnel_tmp=$(mktemp -d)
+    tunnel_action=$1
+    if [ "$tunnel_action" = enable ]; then
+        # Explicit environment overrides take priority over the last saved settings.
+        tunnel_load > "$tunnel_tmp/saved.env"
+        python3 - "$tunnel_tmp/saved.env" <<'PY'
+import os, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+p.write_text(''.join(line+'\n' for line in p.read_text().splitlines() if line.partition('=')[0] not in os.environ))
+PY
+        . "$tunnel_tmp/saved.env"
+        TUNNEL_NODE_HOST=$(manager_read_default '节点完整子域名' "${TUNNEL_NODE_HOST:-}")
+        TUNNEL_SUB_HOST=$(manager_read_default '订阅完整子域名' "${TUNNEL_SUB_HOST:-}")
+        TUNNEL_WS_PORT=$(manager_read_default 'WebSocket 本机端口' "${TUNNEL_WS_PORT:-18081}")
+        TUNNEL_SUB_PORT=$(manager_read_default '隧道订阅本机端口' "${TUNNEL_SUB_PORT:-18082}")
+        TUNNEL_METRICS_PORT=${TUNNEL_METRICS_PORT:-20241}
+        export TUNNEL_NODE_HOST TUNNEL_SUB_HOST TUNNEL_WS_PORT TUNNEL_SUB_PORT TUNNEL_METRICS_PORT
+        TUNNEL_WS_PATH=${TUNNEL_WS_PATH:-}
+        export TUNNEL_WS_PATH
+        tunnel_stage enable
+        echo "在 Cloudflare 控制台创建 cloudflared 命名隧道，并添加两条已发布应用路由："
+        echo "  $TUNNEL_NODE_HOST → HTTP 127.0.0.1:$TUNNEL_WS_PORT"
+        echo "  $TUNNEL_SUB_HOST → HTTP 127.0.0.1:$TUNNEL_SUB_PORT"
+        echo "两个域名不要配置交互式 Access 登录；WebSocket 路由不填写 Path。"
+        echo "本机无需证书；TLS 在 Cloudflare 边缘终止。VPS 需能出站访问 TCP 7844。"
+        TUNNEL_TOKEN=${XRAY_TUNNEL_TOKEN:-}
+        unset XRAY_TUNNEL_TOKEN
+        if [ -z "$TUNNEL_TOKEN" ]; then
+            TUNNEL_TOKEN=$(manager_read_secret '粘贴隧道 Token（隐藏输入，回车保留已有 Token）: ')
+        fi
+        if [ -n "$TUNNEL_TOKEN" ]; then
+            printf '%s' "$TUNNEL_TOKEN" > "$tunnel_tmp/tunnel-token"
+        elif [ -s "$XRAY_DIR/tunnel-token" ]; then
+            cp "$XRAY_DIR/tunnel-token" "$tunnel_tmp/tunnel-token"
+        else
+            error_exit "未提供隧道 Token"
+        fi
+        unset TUNNEL_TOKEN
+        python3 - "$tunnel_tmp/tunnel-token" <<'PY'
+import re, sys
+from pathlib import Path
+if not re.fullmatch(r'[A-Za-z0-9_+/=-]{40,8192}', Path(sys.argv[1]).read_text()):
+    sys.exit('Token 格式无效：仅粘贴 Token，不要粘贴整条安装命令')
+PY
+    else
+        tunnel_enabled || { echo "隧道尚未启用。"; exit 0; }
+        tunnel_stage disable
+        echo "将停止隧道及其订阅服务，并移除 WebSocket 入站。Cloudflare 上的隧道与 DNS 保留。"
+    fi
+    "$XRAY_BIN" run -test -c "$tunnel_tmp/config.json" </dev/null > "$tunnel_tmp/xray-test.log" 2>&1 || error_exit "Xray 不接受候选配置，现有服务未改动"
+    tunnel_confirm=$(manager_read '确认已设置路由并应用？输入 y 继续，其他输入取消: ')
+    case "$tunnel_confirm" in y|Y) ;; *) echo "已取消。"; exit 0 ;; esac
+    if [ "$tunnel_action" = enable ]; then tunnel_install_binary; fi
+    tunnel_backup="$XRAY_DIR/tunnel-backup-$(date +%Y%m%d-%H%M%S)-$$"
+    mkdir -m 700 "$tunnel_backup"
+    for tunnel_name in config.json tunnel.json tunnel-token; do
+        [ ! -f "$XRAY_DIR/$tunnel_name" ] || cp -p "$XRAY_DIR/$tunnel_name" "$tunnel_backup/$tunnel_name"
+    done
+    tunnel_committed=1
+    cp "$tunnel_tmp/config.json" "$XRAY_CONFIG"
+    cp "$tunnel_tmp/tunnel.json" "$XRAY_DIR/tunnel.json"
+    chmod 600 "$XRAY_CONFIG" "$XRAY_DIR/tunnel.json"
+    if [ "$tunnel_action" = enable ]; then
+        cp "$tunnel_tmp/tunnel-token" "$XRAY_DIR/tunnel-token"
+        chmod 600 "$XRAY_DIR/tunnel-token"
+        write_clash_sub_httpd
+        manager_restart_xray
+        manager_check_listeners
+        tunnel_services start
+        tunnel_health public
+    else
+        tunnel_services stop
+        manager_restart_xray
+        manager_check_listeners
+        rm -f -- "$XRAY_DIR/tunnel-token"
+    fi
+    tunnel_success=1
+    echo "✅ 隧道配置已应用。原配置备份：$tunnel_backup"
+    if [ "$tunnel_action" = enable ]; then tunnel_show; fi
+)
+
+tunnel_menu() {
+    manager_require_platform
+    while :; do
+        echo ""
+        echo "========== 固定 Cloudflare Tunnel =========="
+        echo "  1. 配置 / 更新固定隧道（节点 + HTTPS 订阅）"
+        echo "  2. 查看隧道链接与域名路由"
+        echo "  3. 检查本机与公网连通性"
+        echo "  4. 停用隧道（保留 REALITY 节点）"
+        echo "  0. 返回"
+        tunnel_choice=$(manager_read '请选择 [0–4]: ') || return 0
+        case "$tunnel_choice" in
+            0) return 0 ;;
+            1) tunnel_configure enable ;;
+            2) tunnel_show ;;
+            3) if tunnel_enabled; then tunnel_health public; else echo "隧道尚未启用。"; fi ;;
+            4) tunnel_configure disable ;;
+            *) echo "无效选项。" ;;
+        esac
+    done
+}
+
 # 菜单和操作分发。各操作在子 shell 执行，失败后仍可返回菜单。
 manager_read() {
     printf '%s' "$1" >&2
@@ -3368,6 +3867,9 @@ manager_require_platform() {
 
 manager_install() {
     manager_require_platform
+    if tunnel_enabled; then
+        error_exit "固定隧道正在使用：请先在菜单 11 停用隧道，再重新安装；普通更新请选 2"
+    fi
     [ "$(uname -m)" = x86_64 ] || error_exit "当前安装包仅支持 x86_64 / amd64"
     if [ -f "$XRAY_CONFIG" ]; then
         echo "检测到已有 Xray 配置。重新安装会生成新的 UUID、密钥和订阅口令。"
@@ -3401,9 +3903,11 @@ manager_install() {
 manager_show_client() {
     [ -f "$SHARE_FILE" ] || error_exit "未找到节点信息，请先选择 1 安装"
     cat "$SHARE_FILE"
+    if tunnel_enabled; then tunnel_show; fi
 }
 
-manager_restart() {
+manager_restart() (
+    set -e
     manager_require_platform
     [ -f "$XRAY_CONFIG" ] || error_exit "尚未安装，请先选择 1"
     if [ "$XRAY_PLATFORM" = alpine ]; then
@@ -3419,19 +3923,29 @@ manager_restart() {
             systemctl restart xray-clash-sub.service
         fi
     fi
-    echo "已执行 Xray 和订阅服务重启。"
-}
+    manager_check_listeners
+    if [ -f "$XRAY_DIR/clash-sub.env" ]; then
+        manager_restart_settings=$(load_node_settings) || exit 1
+        eval "$manager_restart_settings"
+        subscription_verify_local
+    fi
+    if tunnel_enabled; then
+        tunnel_services start
+        tunnel_health local
+    fi
+    echo "✅ Xray 和订阅服务已重启并通过自检。"
+)
 
 manager_logs() {
     if [ -f /etc/alpine-release ]; then
-        for manager_log in /var/log/xray.log /var/log/xray-clash-sub.log; do
+        for manager_log in /var/log/xray.log /var/log/xray-clash-sub.log /var/log/xray-cloudflared.log /var/log/xray-tunnel-sub.log; do
             if [ -f "$manager_log" ]; then
                 printf '\n%s\n' "$manager_log"
                 tail -n 60 "$manager_log"
             fi
         done
     else
-        journalctl -u xray.service -u xray-clash-sub.service -n 80 --no-pager
+        journalctl -u xray.service -u xray-clash-sub.service -u xray-cloudflared.service -u xray-tunnel-sub.service -n 80 --no-pager
     fi
 }
 
@@ -3855,7 +4369,13 @@ manager_dispatch() (
                     CLASH_SUB_HTTPS=import ;;
             esac
             update_subscription ;;
-        4) run_diagnostic ;;
+        4)
+            if tunnel_enabled; then
+                echo "固定隧道已启用，检查隧道、本机 WebSocket 和公网域名路由..."
+                tunnel_health public
+            else
+                run_diagnostic
+            fi ;;
         5)
             manager_bundle=$(manager_read '导出路径 [/root/sub-cert.p12]: ') || exit 1
             subscription_export_certificate "${manager_bundle:-/root/sub-cert.p12}" ;;
@@ -3863,7 +4383,8 @@ manager_dispatch() (
         8) manager_restart ;;
         9) manager_logs ;;
         10) set +e; manager_config_menu ;;
-        *) error_exit "无效选项，请选择 0–10" ;;
+        11) set +e; tunnel_menu ;;
+        *) error_exit "无效选项，请选择 0–11" ;;
     esac
 )
 
@@ -3883,6 +4404,7 @@ manager_menu() {
   8. 重启 Xray 和订阅服务
   9. 查看最近日志
  10. 修改配置（端口 / NAT / 节点 / SOCKS5 / HTTPS）
+ 11. 固定 Cloudflare Tunnel（域名节点 / HTTPS 订阅）
   0. 退出
 MENU
 }
@@ -3890,14 +4412,14 @@ MENU
 manager_main() {
     case "${1:-}" in
         --help|-h)
-            echo "用法：sh xray.sh [0–10]"
+            echo "用法：sh xray.sh [0–11]"
             echo "无参数进入菜单；也可直接指定菜单编号。Alpine 与 Debian 使用同一个文件。"
             manager_menu
             return 0 ;;
     esac
     [ "$#" -le 1 ] || { echo "只接受一个菜单编号；使用 --help 查看帮助" >&2; return 1; }
     case "${1:-}" in
-        ''|[0-9]|10) ;;
+        ''|[0-9]|10|11) ;;
         *) echo "无效选项；使用 sh xray.sh --help 查看帮助" >&2; return 1 ;;
     esac
     # 终端优先；无终端时支持从 stdin 读取编号，EOF 正常退出。
@@ -3913,16 +4435,16 @@ manager_main() {
     fi
     while :; do
         manager_menu
-        manager_choice=$(manager_read '请选择 [0–10]: ') || break
+        manager_choice=$(manager_read '请选择 [0–11]: ') || break
         case "$manager_choice" in
             0) break ;;
-            [1-9]|10)
+            [1-9]|10|11)
                 manager_dispatch "$manager_choice"
                 manager_result=$?
                 if [ "$manager_result" -ne 0 ]; then
                     echo "操作未完成（退出码 $manager_result），请查看上方提示。"
                 fi ;;
-            *) echo "无效选项，请输入 0–10。" ;;
+            *) echo "无效选项，请输入 0–11。" ;;
         esac
     done
 }
